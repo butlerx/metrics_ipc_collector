@@ -14,7 +14,7 @@ fn write_event(
     event: &MetricEvent,
 ) -> Result<(), io::Error> {
     let json_bytes =
-        serde_json::to_vec(event).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        rmp_serde::to_vec(event).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let mut stream = stream.lock().unwrap();
     stream.write_all(&json_bytes)?;
     stream.write_all(b"\n")?;

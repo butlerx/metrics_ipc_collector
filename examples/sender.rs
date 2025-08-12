@@ -9,7 +9,7 @@ use metrics_ipc_collector::IPCRecorderBuilder;
 
 fn main() {
     // Create an IPCRecorderBuilder and configure the socket path.
-    let builder = IPCRecorderBuilder::default().socket("my_metrics.sock");
+    let builder = IPCRecorderBuilder::default();
 
     // Attempt to build the IPC recorder and set it as the global recorder.
     if let Err(e) = builder.build() {

@@ -8,5 +8,7 @@ pub enum MetricsError {
     #[error("failed to set IPCRecorder: {0}")]
     Recorder(#[from] metrics::SetRecorderError<IPCRecorder>),
     #[error("couldnt serialize event: {0}")]
-    Serialization(#[from] serde_json::Error),
+    Serialization(#[from] rmp_serde::encode::Error),
+    #[error("failed to deserialize event: {0}")]
+    Deserialization(#[from] rmp_serde::decode::Error),
 }

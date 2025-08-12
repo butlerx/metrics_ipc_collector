@@ -6,8 +6,10 @@ use interprocess::local_socket::{
     GenericFilePath, GenericNamespaced, ListenerNonblockingMode, ListenerOptions, Stream,
     prelude::*,
 };
+use rmp_serde::Deserializer;
+use serde::Deserialize;
 use std::{
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Cursor},
     path::PathBuf,
     thread,
 };
@@ -69,22 +71,9 @@ impl IPCCollector {
     }
 }
 
-fn handle_error(conn: std::io::Result<Stream>) -> Option<Stream> {
-    match conn {
-        Ok(c) => Some(c),
-        // If the connection fails, log the error and return None
-        Err(e) => {
-            log::warn!("Failed to accept connection: {e}");
-            None
-        }
-    }
-}
-
-fn line_filter(line: Result<String, std::io::Error>) -> Option<String> {
-    match line {
-        Ok(l) if !l.trim().is_empty() => Some(l),
-        _ => None,
-    }
+// We can safely filter out any errors from the incoming stream
+fn filter_streams(conn: std::io::Result<Stream>) -> Option<Stream> {
+    conn.ok()
 }
 
 fn run_collector(socket_path: String) -> Result<(), MetricsError> {
@@ -97,16 +86,24 @@ fn run_collector(socket_path: String) -> Result<(), MetricsError> {
     let listener = ListenerOptions::new().name(socket_name).create_sync()?;
     listener.set_nonblocking(ListenerNonblockingMode::Both)?;
 
-    for stream in listener.incoming().filter_map(handle_error) {
+    for stream in listener.incoming().filter_map(filter_streams) {
         thread::spawn(move || {
-            let reader = BufReader::new(stream);
-            for line in reader.lines().filter_map(line_filter) {
-                match serde_json::from_str::<MetricEvent>(&line) {
-                    Ok(MetricEvent::Metadata(metadata)) => handle_metadata_event(metadata),
-                    Ok(MetricEvent::Metric(metric)) => handle_metric_event(metric),
-                    Err(e) => {
-                        log::error!("Failed to deserialize metric event: {e} (line: {line})");
+            let mut reader = BufReader::new(stream);
+            let mut buffer: Vec<u8> = Vec::new();
+
+            loop {
+                buffer.clear();
+                match reader.read_until(b'\n', &mut buffer) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let mut de = Deserializer::new(Cursor::new(&buffer));
+                        match Deserialize::deserialize(&mut de) {
+                            Ok(MetricEvent::Metadata(metadata)) => handle_metadata_event(metadata),
+                            Ok(MetricEvent::Metric(metric)) => handle_metric_event(metric),
+                            Err(e) => log::error!("{e}"),
+                        }
                     }
+                    Err(e) => log::error!("Failed to read line: {e}"),
                 }
             }
         });
