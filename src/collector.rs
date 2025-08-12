@@ -100,7 +100,7 @@ fn run_collector(socket_path: String) -> Result<(), MetricsError> {
                         match Deserialize::deserialize(&mut de) {
                             Ok(MetricEvent::Metadata(metadata)) => handle_metadata_event(metadata),
                             Ok(MetricEvent::Metric(metric)) => handle_metric_event(metric),
-                            Err(e) => log::error!("{e}"),
+                            Err(e) => log::trace!("{e}"),
                         }
                     }
                     // If we encounter an error reading from the stream, we just skip it
