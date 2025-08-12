@@ -1,0 +1,23 @@
+[package]
+name = "metrics_ipc_collector"
+version = "0.1.0"
+edition = "2024"
+description = "A metrics collector that uses interprocess communication to collect metrics from multiple processes."
+license = "Apache-2.0"
+readme = "README.md"
+authors = ["Cian Butler <butlerx@notthe.cloud>"]
+repository = "https://github.com/butlerx/metrics_ipc_collector"
+categories = ["development-tools::debugging"]
+keywords = ["metrics", "telemetry", "interprocess", "ipc", "pipe"]
+
+[dependencies]
+interprocess = "2.2"
+log = "0.4"
+metrics = "0.24"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0.14"
+
+[dev-dependencies]
+ctrlc = "3.4"
+metrics-exporter-prometheus = "0.17"
