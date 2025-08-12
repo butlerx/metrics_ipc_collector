@@ -6,10 +6,8 @@ use interprocess::local_socket::{
     GenericFilePath, GenericNamespaced, ListenerNonblockingMode, ListenerOptions, Stream,
     prelude::*,
 };
-use rmp_serde::Deserializer;
-use serde::Deserialize;
 use std::{
-    io::{BufRead, BufReader, Cursor},
+    io::{BufRead, BufReader},
     path::PathBuf,
     thread,
 };
@@ -95,14 +93,11 @@ fn run_collector(socket_path: String) -> Result<(), MetricsError> {
                 buffer.clear();
                 match reader.read_until(b'\n', &mut buffer) {
                     Ok(0) => break,
-                    Ok(_) => {
-                        let mut de = Deserializer::new(Cursor::new(&buffer));
-                        match Deserialize::deserialize(&mut de) {
-                            Ok(MetricEvent::Metadata(metadata)) => handle_metadata_event(metadata),
-                            Ok(MetricEvent::Metric(metric)) => handle_metric_event(metric),
-                            Err(e) => log::trace!("{e}"),
-                        }
-                    }
+                    Ok(_) => match MetricEvent::try_from(&buffer) {
+                        Ok(MetricEvent::Metadata(metadata)) => handle_metadata_event(metadata),
+                        Ok(MetricEvent::Metric(metric)) => handle_metric_event(metric),
+                        Err(e) => log::trace!("{e}"),
+                    },
                     // If we encounter an error reading from the stream, we just skip it
                     Err(_) => {}
                 }

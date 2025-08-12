@@ -5,20 +5,19 @@ use crate::{
 use interprocess::local_socket::{GenericFilePath, GenericNamespaced, prelude::*};
 use std::{
     collections::BTreeMap,
-    io::{self, Write},
+    io::Write,
     sync::{Arc, Mutex},
 };
 
 fn write_event(
     stream: &Arc<Mutex<LocalSocketStream>>,
-    event: &MetricEvent,
-) -> Result<(), io::Error> {
-    let json_bytes =
-        rmp_serde::to_vec(event).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    event: MetricEvent,
+) -> Result<(), MetricsError> {
+    let bytes: Vec<u8> = event.try_into()?;
     let mut stream = stream.lock().unwrap();
-    stream.write_all(&json_bytes)?;
+    stream.write_all(&bytes)?;
     stream.write_all(b"\n")?;
-    stream.flush()
+    stream.flush().map_err(Into::into)
 }
 
 #[derive(Debug)]
@@ -41,7 +40,7 @@ impl Handle {
                 .collect::<BTreeMap<_, _>>(),
             operation: op,
         };
-        let _ = write_event(&self.stream.clone(), &MetricEvent::Metric(metric));
+        let _ = write_event(&self.stream.clone(), MetricEvent::Metric(metric));
     }
 }
 
@@ -101,7 +100,7 @@ impl IPCRecorder {
             unit: unit.map(|u| u.as_str().to_string()),
             description: description.to_string(),
         };
-        let _ = write_event(&self.stream.clone(), &MetricEvent::Metadata(metadata));
+        let _ = write_event(&self.stream.clone(), MetricEvent::Metadata(metadata));
     }
 }
 

@@ -1,3 +1,4 @@
+use crate::error::MetricsError;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -43,4 +44,20 @@ pub enum MetricOperation {
 pub enum MetricEvent {
     Metadata(MetricMetadata),
     Metric(MetricData),
+}
+
+impl TryFrom<&Vec<u8>> for MetricEvent {
+    type Error = MetricsError;
+
+    fn try_from(buffer: &Vec<u8>) -> Result<Self, Self::Error> {
+        rmp_serde::from_slice(buffer).map_err(MetricsError::from)
+    }
+}
+
+impl TryFrom<MetricEvent> for Vec<u8> {
+    type Error = MetricsError;
+
+    fn try_from(event: MetricEvent) -> Result<Self, Self::Error> {
+        rmp_serde::to_vec(&event).map_err(MetricsError::from)
+    }
 }
