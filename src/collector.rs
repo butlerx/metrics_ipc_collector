@@ -103,7 +103,8 @@ fn run_collector(socket_path: String) -> Result<(), MetricsError> {
                             Err(e) => log::error!("{e}"),
                         }
                     }
-                    Err(e) => log::error!("Failed to read line: {e}"),
+                    // If we encounter an error reading from the stream, we just skip it
+                    Err(_) => {}
                 }
             }
         });

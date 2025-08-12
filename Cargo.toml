@@ -1,6 +1,6 @@
 [package]
 name = "metrics_ipc_collector"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "A metrics collector that uses interprocess communication to collect metrics from multiple processes."
 license = "Apache-2.0"
