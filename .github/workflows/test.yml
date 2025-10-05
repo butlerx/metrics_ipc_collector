@@ -1,37 +1,42 @@
-name: Test
+name: Test code on PR
 on:
   push:
+    # While it may seem silly to re-test a pr after merging it we need to so as
+    # to have an up to date cache for the next PR. GH actions caches dont let
+    # branches access each others caches, except the cache owned by main.
     branches: [master, main]
+    paths:
+      - '.github/workflows/test-pr.yml'
+      - 'crates/**'
+      - 'Cargo.lock'
   pull_request:
     branches: [master, main]
 env:
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: '-C debuginfo=0 -A dead_code'
   CARGO_TERM_COLOR: always
 jobs:
   test:
+    name: Run Tests and Lint
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Cache Rust dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+        uses: actions/checkout@v5
       - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-          override: true
-      - name: Build
-        run: cargo build
-      - name: Check formatting
-        run: cargo fmt -- --check
-      - name: Run clippy
-        run: cargo clippy -- -D warnings
-      - name: Run tests
-        run: cargo test
+          components: clippy, rustfmt
+      - name: Cache Dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cargo-all-features
+          cache-on-failure: true
+      - name: Enforce Cargo fmt
+        run: cargo fmt --check
+      - name: Clippy
+        uses: clechasseur/rs-clippy-check@v5
+        with:
+          args: --all-features -- -D warnings
+      - name: Run Tests
+        run: cargo test --all-features

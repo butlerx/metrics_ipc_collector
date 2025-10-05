@@ -2,14 +2,21 @@ use crate::{
     error::MetricsError,
     events::{MetricData, MetricEvent, MetricKind, MetricMetadata, MetricOperation},
 };
-use interprocess::local_socket::{
-    GenericFilePath, GenericNamespaced, ListenerNonblockingMode, ListenerOptions, Stream,
-    prelude::*,
-};
+#[cfg(feature = "tokio")]
+use interprocess::local_socket::tokio::prelude::*;
+use interprocess::local_socket::{GenericFilePath, GenericNamespaced, ListenerOptions};
+#[cfg(not(feature = "tokio"))]
+use interprocess::local_socket::{ListenerNonblockingMode, Stream, prelude::*};
+use std::path::PathBuf;
+#[cfg(not(feature = "tokio"))]
 use std::{
     io::{BufRead, BufReader},
-    path::PathBuf,
     thread,
+};
+#[cfg(feature = "tokio")]
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    task,
 };
 
 pub struct IPCCollector {
@@ -33,13 +40,13 @@ impl IPCCollector {
     }
 
     /// Sets up the IPC collector to start collecting metrics from the specified socket.
-    /// This function spawns a thread that listens for incoming connections on the socket and
+    /// This function spawns a thread/task that listens for incoming connections on the socket and
     /// processes metric events.
     /// The metrics collected can then be exported using any of the regular metric export crates.
     /// If the socket file already exists, it will be removed before starting the collector.
     ///
     /// # Example
-    /// ```rust
+    /// ```
     /// use metrics_ipc_collector::IPCCollector;
     /// let collector = IPCCollector::default();
     /// if let Err(e) = collector.start_collecting() {
@@ -57,8 +64,18 @@ impl IPCCollector {
             std::fs::remove_file(&socket_file)?;
         }
 
+        #[cfg(not(feature = "tokio"))]
         thread::spawn(move || {
             if let Err(e) = run_collector(socket_path.clone()) {
+                log::error!("Metrics collector error: {e}");
+            }
+            // Clean up socket file on shutdown
+            let _ = std::fs::remove_file(&socket_file);
+        });
+
+        #[cfg(feature = "tokio")]
+        task::spawn(async move {
+            if let Err(e) = run_collector(socket_path.clone()).await {
                 log::error!("Metrics collector error: {e}");
             }
             // Clean up socket file on shutdown
@@ -70,10 +87,12 @@ impl IPCCollector {
 }
 
 // We can safely filter out any errors from the incoming stream
+#[cfg(not(feature = "tokio"))]
 fn filter_streams(conn: std::io::Result<Stream>) -> Option<Stream> {
     conn.ok()
 }
 
+#[cfg(not(feature = "tokio"))]
 fn run_collector(socket_path: String) -> Result<(), MetricsError> {
     let socket_name = if GenericNamespaced::is_supported() {
         socket_path.to_ns_name::<GenericNamespaced>()?
@@ -105,6 +124,42 @@ fn run_collector(socket_path: String) -> Result<(), MetricsError> {
         });
     }
     Ok(())
+}
+
+#[cfg(feature = "tokio")]
+async fn run_collector(socket_path: String) -> Result<(), MetricsError> {
+    let socket_name = if GenericNamespaced::is_supported() {
+        socket_path.to_ns_name::<GenericNamespaced>()?
+    } else {
+        format!("/tmp/{socket_path}").to_fs_name::<GenericFilePath>()?
+    };
+
+    let listener = ListenerOptions::new().name(socket_name).create_tokio()?;
+
+    loop {
+        if let Ok(stream) = listener.accept().await {
+            task::spawn(async move {
+                let mut reader = BufReader::new(stream);
+                let mut buffer: Vec<u8> = Vec::new();
+
+                loop {
+                    buffer.clear();
+                    match reader.read_until(b'\n', &mut buffer).await {
+                        Ok(0) => break,
+                        Ok(_) => match MetricEvent::try_from(&buffer) {
+                            Ok(MetricEvent::Metadata(metadata)) => {
+                                handle_metadata_event(metadata);
+                            }
+                            Ok(MetricEvent::Metric(metric)) => handle_metric_event(metric),
+                            Err(e) => log::trace!("{e}"),
+                        },
+                        // If we encounter an error reading from the stream, we just skip it
+                        Err(_) => {}
+                    }
+                }
+            });
+        }
+    }
 }
 
 fn handle_metric_event(metric: MetricData) {

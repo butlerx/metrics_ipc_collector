@@ -14,6 +14,9 @@ collecting metrics, making it suitable for multi-process applications.
 
 - Supports all formats provided by the metrics crate.
 - Supports multiple platforms
+- Async Support. When the `tokio` feature flag is set the listener will
+  automatically use a tokio task rather then a spawn. Note: this needs to be
+  started in a tokio process
 
 ## Installation
 
