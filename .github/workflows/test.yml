@@ -5,10 +5,6 @@ on:
     # to have an up to date cache for the next PR. GH actions caches dont let
     # branches access each others caches, except the cache owned by main.
     branches: [master, main]
-    paths:
-      - '.github/workflows/test-pr.yml'
-      - 'crates/**'
-      - 'Cargo.lock'
   pull_request:
     branches: [master, main]
 env:
