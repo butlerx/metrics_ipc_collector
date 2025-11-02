@@ -1,6 +1,6 @@
 [package]
 name        = "metrics_ipc_collector"
-version     = "0.2.2"
+version     = "0.3.0"
 edition     = "2024"
 description = "A metrics collector that uses interprocess communication to collect metrics from multiple processes."
 license     = "Apache-2.0"
@@ -28,5 +28,6 @@ ctrlc                       = "3.4"
 metrics-exporter-prometheus = "0.17"
 
 [features]
+# Enable async support with Tokio runtime. When enabled, collector operations use async tasks and require a Tokio runtime.
 default = []
 tokio   = ["dep:tokio", "interprocess/tokio"]

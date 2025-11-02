@@ -1,4 +1,6 @@
-//! This example demonstrates how to set up the IPCCollector for gathering metrics and the Prometheus exporter for exposing them.
+//! Async Example: IPCCollector with Prometheus exporter.
+//!
+//! **Requires the `tokio` feature flag and a Tokio runtime.**
 //!
 //! The IPCCollector listens for metrics data from other processes via an IPC socket, while the Prometheus exporter makes these metrics accessible via an HTTP endpoint for scraping by Prometheus or other compatible monitoring systems. The example also gracefully handles termination signals (Ctrl+C) to ensure clean shutdown.
 //! The metrics are available on `0.0.0.0:9000` for inspection

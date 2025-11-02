@@ -1,3 +1,13 @@
+//! `IPCCollector` implementation for metrics aggregation via IPC.
+//!
+//! ## Async Support
+//!
+//! This module supports async metric collection when the `tokio` feature flag is enabled.
+//! - With `tokio` enabled, all collector operations use async tasks and require a Tokio runtime.
+//! - Without `tokio`, the collector uses threads and blocking IO.
+//!
+//! See crate-level docs and README for details.
+
 use crate::{
     error::MetricsError,
     events::{MetricData, MetricEvent, MetricKind, MetricMetadata, MetricOperation},
@@ -19,6 +29,58 @@ use tokio::{
     task,
 };
 
+/// Collects metrics from multiple processes via IPC.
+///
+/// The `IPCCollector` listens on a local socket for incoming metric events from other processes.
+/// It supports both synchronous (threaded) and asynchronous (Tokio) operation, depending on the crate feature flags.
+///
+/// # Examples
+///
+/// Basic usage:
+/// ```rust
+/// use metrics_ipc_collector::IPCCollector;
+/// let collector = IPCCollector::default();
+/// collector.start_collecting()?;
+/// ```
+///
+/// See [`start_collecting`](#method.start_collecting) for more details and error handling.
+///
+/// # Feature Flags
+/// - `tokio`: Enables async support. Requires a Tokio runtime.
+///
+/// # Errors
+/// Creating the collector may fail if the socket file cannot be created or removed.
+///
+/// # See Also
+/// - [`IPCRecorderBuilder`](crate::recorder::IPCRecorderBuilder)
+/// - [`MetricsError`](crate::error::MetricsError)
+///
+/// Collects metrics from multiple processes via IPC.
+///
+/// The `IPCCollector` listens on a local socket for incoming metric events from other processes.
+/// It supports both synchronous (threaded) and asynchronous (Tokio) operation, depending on the crate feature flags.
+///
+/// # Examples
+///
+/// Basic usage:
+/// ```rust
+/// use metrics_ipc_collector::IPCCollector;
+/// let collector = IPCCollector::default();
+/// collector.start_collecting()?;
+/// ```
+///
+/// See [`start_collecting`](#method.start_collecting) for more details and error handling.
+///
+/// # Feature Flags
+/// - `tokio`: Enables async support. Requires a Tokio runtime.
+///
+/// # Errors
+/// Creating the collector may fail if the socket file cannot be created or removed.
+///
+/// # See Also
+/// - [`IPCRecorderBuilder`](crate::recorder::IPCRecorderBuilder)
+/// - [`MetricsError`](crate::error::MetricsError)
+///
 pub struct IPCCollector {
     socket_path: String,
 }
@@ -40,8 +102,13 @@ impl IPCCollector {
     }
 
     /// Sets up the IPC collector to start collecting metrics from the specified socket.
-    /// This function spawns a thread/task that listens for incoming connections on the socket and
-    /// processes metric events.
+    ///
+    /// This function spawns a thread (default) or an async Tokio task (if the `tokio` feature is enabled)
+    /// that listens for incoming connections on the socket and processes metric events.
+    ///
+    /// - **Async Support:** If the `tokio` feature is enabled, this function uses async tasks and requires a Tokio runtime.
+    ///   Otherwise, it uses threads and blocking IO.
+    ///
     /// The metrics collected can then be exported using any of the regular metric export crates.
     /// If the socket file already exists, it will be removed before starting the collector.
     ///
@@ -53,6 +120,9 @@ impl IPCCollector {
     ///     eprintln!("Failed to start metrics collector: {}", e);
     /// }
     /// ```
+    ///
+    /// # Feature Flags
+    /// - `tokio`: Enables async support. Requires a Tokio runtime.
     ///
     /// # Errors
     /// This function will return an error if it fails to create the socket file or if there are issues
@@ -171,7 +241,7 @@ fn handle_metric_event(metric: MetricData) {
                 let labels: Vec<_> = metric
                     .labels
                     .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
                 metrics::counter!(metric.name, &labels).increment(value);
             }
@@ -183,7 +253,7 @@ fn handle_metric_event(metric: MetricData) {
                 let labels: Vec<_> = metric
                     .labels
                     .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
                 metrics::counter!(metric.name, &labels).absolute(value);
             }
@@ -195,7 +265,7 @@ fn handle_metric_event(metric: MetricData) {
                 let labels: Vec<_> = metric
                     .labels
                     .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
                 metrics::gauge!(metric.name, &labels).increment(value);
             }
@@ -207,7 +277,7 @@ fn handle_metric_event(metric: MetricData) {
                 let labels: Vec<_> = metric
                     .labels
                     .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
                 metrics::gauge!(metric.name, &labels).decrement(value);
             }
@@ -219,7 +289,7 @@ fn handle_metric_event(metric: MetricData) {
                 let labels: Vec<_> = metric
                     .labels
                     .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
                 metrics::gauge!(metric.name, &labels).set(value);
             }
@@ -231,7 +301,7 @@ fn handle_metric_event(metric: MetricData) {
                 let labels: Vec<_> = metric
                     .labels
                     .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
                 metrics::histogram!(metric.name, &labels).record(value);
             }

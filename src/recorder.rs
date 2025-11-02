@@ -74,13 +74,43 @@ impl metrics::HistogramFn for Handle {
     }
 }
 
-/// An IPC recorder.
+/// An IPC recorder for sending metrics to an IPC socket.
+///
+/// The `IPCRecorder` implements the [`metrics::Recorder`](https://docs.rs/metrics/latest/metrics/trait.Recorder.html) trait and sends metric events to a local socket for aggregation by an [`IPCCollector`](crate::collector::IPCCollector).
+///
+/// # Usage
+/// Typically, you do not construct an `IPCRecorder` directly. Instead, use [`IPCRecorderBuilder`](crate::recorder::IPCRecorderBuilder) to configure and install the recorder globally:
+///
+/// ```rust
+/// use metrics_ipc_collector::IPCRecorderBuilder;
+/// let builder = IPCRecorderBuilder::default().socket("my_metrics.sock");
+/// builder.build()?;
+/// ```
+///
+/// # See Also
+/// - [`IPCCollector`](crate::collector::IPCCollector)
+/// - [`IPCRecorderBuilder`](crate::recorder::IPCRecorderBuilder)
+///
 #[derive(Debug, Clone)]
 pub struct IPCRecorder {
     stream: Arc<Mutex<LocalSocketStream>>,
 }
 
 impl IPCRecorder {
+    /// Creates a new `IPCRecorder` from a local socket stream.
+    ///
+    /// This is a low-level constructor. Most users should use [`IPCRecorderBuilder`](crate::recorder::IPCRecorderBuilder) to configure and install the recorder.
+    ///
+    /// # Arguments
+    /// * `stream` - The local socket stream to send metric events to.
+    ///
+    /// # Example
+    /// ```rust
+    /// # use metrics_ipc_collector::IPCRecorder;
+    /// # use interprocess::local_socket::LocalSocketStream;
+    /// # let stream = LocalSocketStream::connect("/tmp/my_metrics.sock").unwrap();
+    /// let recorder = IPCRecorder::new(stream);
+    /// ```
     pub fn new(stream: LocalSocketStream) -> Self {
         Self {
             stream: Arc::new(Mutex::new(stream)),
@@ -153,6 +183,17 @@ impl metrics::Recorder for IPCRecorder {
     }
 }
 
+/// Builder for configuring and creating an [`IPCRecorder`](crate::recorder::IPCRecorder).
+///
+/// Use this builder to set the socket path and install the recorder globally.
+///
+/// # Example
+/// ```rust
+/// use metrics_ipc_collector::IPCRecorderBuilder;
+/// let builder = IPCRecorderBuilder::default().socket("my_metrics.sock");
+/// builder.build()?;
+/// ```
+///
 #[derive(Debug)]
 pub struct IPCRecorderBuilder {
     socket_path: String,
@@ -168,6 +209,15 @@ impl Default for IPCRecorderBuilder {
 
 impl IPCRecorderBuilder {
     /// Sets the path for the IPC socket file.
+    ///
+    /// # Arguments
+    /// * `socket_path` - The path to the IPC socket file.
+    ///
+    /// # Example
+    /// ```rust
+    /// use metrics_ipc_collector::IPCRecorderBuilder;
+    /// let builder = IPCRecorderBuilder::default().socket("my_metrics.sock");
+    /// ```
     #[must_use]
     pub fn socket(mut self, socket_path: &str) -> Self {
         self.socket_path = socket_path.to_string();
@@ -175,6 +225,7 @@ impl IPCRecorderBuilder {
     }
 
     /// Builds the IPC recorder and sets it as the global recorder.
+    ///
     /// This function connects to the IPC socket specified by `socket_path` and sets up the recorder.
     /// All metrics recorded after this call will be sent to the IPC socket.
     ///
@@ -182,13 +233,10 @@ impl IPCRecorderBuilder {
     /// ```rust
     /// use metrics_ipc_collector::IPCRecorderBuilder;
     /// let builder = IPCRecorderBuilder::default().socket("my_metrics.sock");
-    /// if let Err(e) = builder.build() {
-    ///     eprintln!("Failed to set up IPC recorder: {}", e);
-    /// }
+    /// builder.build()?;
     /// ```
     ///
     /// # Errors
-    ///
     /// Returns an error if the IPC connection cannot be established or if the recorder cannot be set.
     pub fn build(self) -> Result<(), MetricsError> {
         let socket_name = if GenericNamespaced::is_supported() {

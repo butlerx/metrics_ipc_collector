@@ -2,6 +2,10 @@ use crate::error::MetricsError;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// The kind of metric being recorded.
+///
+/// Used to distinguish between counters, gauges, and histograms.
+///
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MetricKind {
     Counter,
@@ -9,6 +13,10 @@ pub enum MetricKind {
     Histogram,
 }
 
+/// Metadata describing a metric.
+///
+/// Includes the metric name, kind, description, and optional unit.
+///
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricMetadata {
     pub name: String,
@@ -18,6 +26,10 @@ pub struct MetricMetadata {
     pub unit: Option<String>,
 }
 
+/// Data for a single metric event.
+///
+/// Contains the metric name, labels, and the operation performed.
+///
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricData {
     pub name: String,
@@ -26,7 +38,10 @@ pub struct MetricData {
     pub operation: MetricOperation,
 }
 
-/// Different metric operations
+/// Different operations that can be performed on a metric.
+///
+/// Includes increment/set for counters and gauges, and record for histograms.
+///
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "value")]
 #[serde(rename_all = "snake_case")]
@@ -39,10 +54,16 @@ pub enum MetricOperation {
     RecordHistogram(f64),
 }
 
+/// An event sent over IPC, representing either metric metadata or metric data.
+///
+/// Used for communication between processes and the collector.
+///
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum MetricEvent {
+    /// Metadata describing the metric (name, kind, description, unit).
     Metadata(MetricMetadata),
+    /// Data for a single metric event (name, labels, operation).
     Metric(MetricData),
 }
 

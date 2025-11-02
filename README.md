@@ -14,9 +14,12 @@ collecting metrics, making it suitable for multi-process applications.
 
 - Supports all formats provided by the metrics crate.
 - Supports multiple platforms
-- Async Support. When the `tokio` feature flag is set the listener will
-  automatically use a tokio task rather then a spawn. Note: this needs to be
-  started in a tokio process
+- **Async Support**: Enable the `tokio` feature flag to use async tasks for metric collection. When enabled, all collector operations run on Tokio tasks and require a Tokio runtime. Enable with:
+  ```toml
+  [dependencies]
+  metrics_ipc_collector = { version = "...", features = ["tokio"] }
+  ```
+  If the `tokio` feature is not enabled, the collector uses threads and blocking IO. Async examples require the feature to be enabled and a Tokio runtime.
 
 ## Installation
 
