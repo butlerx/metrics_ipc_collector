@@ -22,6 +22,18 @@ mod error;
 mod events;
 mod recorder;
 
-pub use collector::IPCCollector;
+#[deprecated(note = "use IPCSocketCollector")]
+pub use collector::socket::IPCSocketCollector as IPCCollector;
+pub use collector::{
+    socket::IPCSocketCollector,
+    unnamed_pipe::{IPCPipeCollector, PipeSender},
+};
 pub use error::MetricsError;
-pub use recorder::{IPCRecorder, IPCRecorderBuilder};
+#[deprecated(note = "use IPCSocketRecorder")]
+pub use recorder::socket::IPCSocketRecorder as IPCRecorder;
+#[deprecated(note = "use IPCSocketRecorderBuilder")]
+pub use recorder::socket::IPCSocketRecorderBuilder as IPCRecorderBuilder;
+pub use recorder::{
+    socket::{IPCSocketRecorder, IPCSocketRecorderBuilder},
+    unnamed_pipe::IPCPipeRecorder,
+};

@@ -4,35 +4,41 @@ on:
     # While it may seem silly to re-test a pr after merging it we need to so as
     # to have an up to date cache for the next PR. GH actions caches dont let
     # branches access each others caches, except the cache owned by main.
-    branches: [master, main]
+    branches:
+      - master
+      - main
   pull_request:
-    branches: [master, main]
+    branches:
+      - master
+      - main
 env:
   RUST_BACKTRACE: 1
   RUSTFLAGS: '-C debuginfo=0 -A dead_code'
   CARGO_TERM_COLOR: always
+permissions:
+  contents: read
 jobs:
   test:
     name: Run Tests and Lint
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
         with:
           toolchain: stable
           components: clippy, rustfmt
       - name: Cache Dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           shared-key: cargo-all-features
           cache-on-failure: true
       - name: Enforce Cargo fmt
         run: cargo fmt --check
       - name: Clippy
-        uses: clechasseur/rs-clippy-check@v5
-        with:
-          args: --all-features -- -D warnings
+        run: cargo clippy --all-features --all-targets -- -D warnings
       - name: Run Tests
         run: cargo test --all-features
