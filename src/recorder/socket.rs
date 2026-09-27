@@ -81,6 +81,8 @@ pub struct IPCSocketRecorder {
 }
 
 impl IPCSocketRecorder {
+    /// Creates a socket recorder backed by an established local socket stream.
+    #[must_use]
     pub fn new(stream: LocalSocketStream) -> Self {
         Self {
             stream: Arc::new(Mutex::new(stream)),

@@ -12,7 +12,7 @@ use std::{
 #[cfg(feature = "tokio")]
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
-    task,
+    runtime::Handle as TokioHandle,
 };
 
 #[cfg(not(feature = "tokio"))]
@@ -39,8 +39,10 @@ impl IPCPipeCollector {
     /// # Errors
     /// Returns an error if pipe creation fails.
     pub fn new() -> Result<(Self, Sender), MetricsError> {
-        let (sender, receiver) = pipe()?;
+        #[cfg(feature = "tokio")]
+        TokioHandle::try_current().map_err(|_| MetricsError::TokioRuntimeRequired)?;
 
+        let (sender, receiver) = pipe()?;
         Ok((Self { receiver }, sender))
     }
 
@@ -56,7 +58,9 @@ impl IPCPipeCollector {
         thread::spawn(move || run_collector(receiver));
 
         #[cfg(feature = "tokio")]
-        task::spawn(async move { run_collector(receiver).await });
+        TokioHandle::try_current()
+            .map_err(|_| MetricsError::TokioRuntimeRequired)?
+            .spawn(async move { run_collector(receiver).await });
 
         Ok(())
     }

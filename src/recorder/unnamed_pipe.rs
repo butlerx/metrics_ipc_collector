@@ -266,3 +266,36 @@ mod tests {
         ));
     }
 }
+
+#[cfg(all(test, not(feature = "tokio")))]
+mod tests {
+    use super::*;
+    use interprocess::unnamed_pipe::pipe;
+    use std::io::{BufRead, BufReader};
+
+    #[test]
+    fn recorder_handle_writes_events_from_sync_callbacks() {
+        let (sender, receiver) = pipe().expect("pipe should be created");
+        let event_sender = Arc::new(Mutex::new(sender));
+        let handle = Handle::new(metrics::Key::from_name("requests"), event_sender);
+
+        metrics::CounterFn::increment(&handle, 7);
+
+        let mut reader = BufReader::new(receiver);
+        let mut buffer = Vec::new();
+        reader
+            .read_until(b'\n', &mut buffer)
+            .expect("pipe should remain readable");
+
+        let event = MetricEvent::try_from(&buffer).expect("event should deserialize");
+        let MetricEvent::Metric(metric) = event else {
+            panic!("expected a metric event");
+        };
+        assert_eq!(metric.name, "requests");
+        assert!(metric.labels.is_empty());
+        assert!(matches!(
+            metric.operation,
+            MetricOperation::IncrementCounter(7)
+        ));
+    }
+}

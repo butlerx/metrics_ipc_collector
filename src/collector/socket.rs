@@ -14,6 +14,7 @@ use std::{
 #[cfg(feature = "tokio")]
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
+    runtime::Handle as TokioHandle,
     task,
 };
 
@@ -55,6 +56,9 @@ impl IPCSocketCollector {
     /// This function will return an error if it fails to create the socket file or if there are issues
     /// with the IPC communication.
     pub fn start_collecting(self) -> Result<(), MetricsError> {
+        #[cfg(feature = "tokio")]
+        let runtime = TokioHandle::try_current().map_err(|_| MetricsError::TokioRuntimeRequired)?;
+
         let socket_path = self.socket_path;
         let socket_file: PathBuf = format!("/tmp/{socket_path}").into();
         if socket_file.exists() {
@@ -71,7 +75,7 @@ impl IPCSocketCollector {
         });
 
         #[cfg(feature = "tokio")]
-        task::spawn(async move {
+        runtime.spawn(async move {
             if let Err(e) = run_collector(socket_path.clone()).await {
                 log::error!("Metrics collector error: {e}");
             }
