@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.1](https://github.com/butlerx/metrics_ipc_collector/compare/v0.4.0...v0.4.1) (2026-09-27)
+
+
+### Bug Fixes
+
+* **ci:** publish without a Cargo lockfile ([63f74a3](https://github.com/butlerx/metrics_ipc_collector/commit/63f74a3a11216a263a51bd7ac16817a2d46b4e25))
+
+
+### Documentation
+
+* backfill changelog ([8debf4f](https://github.com/butlerx/metrics_ipc_collector/commit/8debf4f2232731ba73e2f5df955aa200ecad4e2d))
+
 ## [0.4.0](https://github.com/butlerx/metrics_ipc_collector/compare/0.3.0...v0.4.0) (2026-09-27)
 
 ### Features
