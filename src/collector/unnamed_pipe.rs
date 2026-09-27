@@ -30,7 +30,7 @@ impl IPCPipeCollector {
     /// to child processes.
     ///
     /// # Example
-    /// ```
+    /// ```no_run
     /// let (collector, sender_handle) = metrics_ipc_collector::IPCPipeCollector::new().unwrap();
     /// // Pass sender_handle to child process via inheritance or serialization
     /// collector.start_collecting().unwrap();
@@ -53,25 +53,17 @@ impl IPCPipeCollector {
         let receiver = self.receiver;
 
         #[cfg(not(feature = "tokio"))]
-        thread::spawn(move || {
-            if let Err(e) = run_collector(receiver) {
-                log::error!("Metrics collector error: {e}");
-            }
-        });
+        thread::spawn(move || run_collector(receiver));
 
         #[cfg(feature = "tokio")]
-        task::spawn(async move {
-            if let Err(e) = run_collector(receiver).await {
-                log::error!("Metrics collector error: {e}");
-            }
-        });
+        task::spawn(async move { run_collector(receiver).await });
 
         Ok(())
     }
 }
 
 #[cfg(not(feature = "tokio"))]
-fn run_collector(receiver: Recver) -> Result<(), MetricsError> {
+fn run_collector(receiver: Recver) {
     let mut reader = BufReader::new(receiver);
     let mut buffer: Vec<u8> = Vec::new();
 
@@ -94,13 +86,10 @@ fn run_collector(receiver: Recver) -> Result<(), MetricsError> {
             }
         }
     }
-    Ok(())
 }
 
 #[cfg(feature = "tokio")]
-async fn run_collector(receiver: Recver) -> Result<(), MetricsError> {
-    // Convert to tokio async pipe
-    let receiver = receiver;
+async fn run_collector(receiver: Recver) {
     let mut reader = BufReader::new(receiver);
     let mut buffer: Vec<u8> = Vec::new();
 
@@ -123,5 +112,4 @@ async fn run_collector(receiver: Recver) -> Result<(), MetricsError> {
             }
         }
     }
-    Ok(())
 }

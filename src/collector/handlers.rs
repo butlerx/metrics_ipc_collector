@@ -1,76 +1,48 @@
 use crate::events::{MetricData, MetricKind, MetricMetadata, MetricOperation};
 
 pub fn handle_metric_event(metric: MetricData) {
+    let labels = metric.labels.into_iter().collect::<Vec<_>>();
+
     match metric.operation {
         MetricOperation::IncrementCounter(value) => {
-            if metric.labels.is_empty() {
+            if labels.is_empty() {
                 metrics::counter!(metric.name).increment(value);
             } else {
-                let labels: Vec<_> = metric
-                    .labels
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect();
                 metrics::counter!(metric.name, &labels).increment(value);
             }
         }
         MetricOperation::SetCounter(value) => {
-            if metric.labels.is_empty() {
+            if labels.is_empty() {
                 metrics::counter!(metric.name).absolute(value);
             } else {
-                let labels: Vec<_> = metric
-                    .labels
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect();
                 metrics::counter!(metric.name, &labels).absolute(value);
             }
         }
         MetricOperation::IncrementGauge(value) => {
-            if metric.labels.is_empty() {
+            if labels.is_empty() {
                 metrics::gauge!(metric.name).increment(value);
             } else {
-                let labels: Vec<_> = metric
-                    .labels
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect();
                 metrics::gauge!(metric.name, &labels).increment(value);
             }
         }
         MetricOperation::DecrementGauge(value) => {
-            if metric.labels.is_empty() {
+            if labels.is_empty() {
                 metrics::gauge!(metric.name).decrement(value);
             } else {
-                let labels: Vec<_> = metric
-                    .labels
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect();
                 metrics::gauge!(metric.name, &labels).decrement(value);
             }
         }
         MetricOperation::SetGauge(value) => {
-            if metric.labels.is_empty() {
+            if labels.is_empty() {
                 metrics::gauge!(metric.name).set(value);
             } else {
-                let labels: Vec<_> = metric
-                    .labels
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect();
                 metrics::gauge!(metric.name, &labels).set(value);
             }
         }
         MetricOperation::RecordHistogram(value) => {
-            if metric.labels.is_empty() {
+            if labels.is_empty() {
                 metrics::histogram!(metric.name).record(value);
             } else {
-                let labels: Vec<_> = metric
-                    .labels
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect();
                 metrics::histogram!(metric.name, &labels).record(value);
             }
         }

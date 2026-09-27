@@ -1,8 +1,8 @@
-//! This example demonstrates how to set up the IPCRecorderBuilder for sending metrics to an IPC socket.
+//! This example demonstrates how to set up the `IPCSocketRecorderBuilder` for sending metrics to an IPC socket.
 //!
-//! The IPCRecorderBuilder establishes a connection to a specified IPC socket and configures it as the global metrics recorder. This allows the application to record metrics such as counters, gauges, and histograms, which are then sent to the IPC socket for collection by a compatible listener.
+//! The `IPCSocketRecorderBuilder` establishes a connection to a specified IPC socket and configures it as the global metrics recorder. This allows the application to record metrics such as counters, gauges, and histograms, which are then sent to the IPC socket for collection by a compatible listener.
 //!
-//! The example includes recording a counter, a gauge, and a histogram metric to illustrate the usage of the IPCRecorderBuilder.
+//! The example includes recording a counter, a gauge, and a histogram metric to illustrate the usage of the `IPCSocketRecorderBuilder`.
 
 fn main() {
     // Create an IPCRecorderBuilder and configure the socket path.
@@ -10,7 +10,7 @@ fn main() {
 
     // Attempt to build the IPC recorder and set it as the global recorder.
     if let Err(e) = builder.build() {
-        eprintln!("Failed to set up IPC recorder: {}", e);
+        eprintln!("Failed to set up IPC recorder: {e}");
         return;
     }
 

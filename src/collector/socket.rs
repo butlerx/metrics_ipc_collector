@@ -44,7 +44,7 @@ impl IPCSocketCollector {
     /// If the socket file already exists, it will be removed before starting the collector.
     ///
     /// # Example
-    /// ```
+    /// ```no_run
     /// let collector = metrics_ipc_collector::IPCSocketCollector::default();
     /// if let Err(e) = collector.start_collecting() {
     ///     eprintln!("Failed to start metrics collector: {}", e);

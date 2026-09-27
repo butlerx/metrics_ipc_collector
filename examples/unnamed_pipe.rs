@@ -25,7 +25,7 @@ fn main() {
     let (handle_tx, handle_rx) = mpsc::sync_channel(1);
 
     if let Err(e) = collector.start_collecting() {
-        eprintln!("Failed to start metrics collector: {}", e);
+        eprintln!("Failed to start metrics collector: {e}");
     }
 
     let sender_handle: PipeHandle = sender.into();
@@ -36,7 +36,7 @@ fn main() {
         let sender = PipeSender::from(handle);
 
         if let Err(e) = IPCPipeRecorder::build(sender) {
-            eprintln!("Failed to set up IPC recorder: {}", e);
+            eprintln!("Failed to set up IPC recorder: {e}");
             return;
         }
 
@@ -75,7 +75,7 @@ async fn main() {
     let (handle_tx, handle_rx) = mpsc::sync_channel(1);
 
     if let Err(e) = collector.start_collecting() {
-        eprintln!("Failed to start metrics collector: {}", e);
+        eprintln!("Failed to start metrics collector: {e}");
     }
 
     let sender_handle: PipeHandle = sender.try_into().unwrap();
@@ -86,7 +86,7 @@ async fn main() {
         let sender = PipeSender::try_from(handle).unwrap();
 
         if let Err(e) = IPCPipeRecorder::build(sender) {
-            eprintln!("Failed to set up IPC recorder: {}", e);
+            eprintln!("Failed to set up IPC recorder: {e}");
             return;
         }
 
