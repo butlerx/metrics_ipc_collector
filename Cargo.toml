@@ -21,7 +21,7 @@ tokio        = { version = "1", features = ["io-util", "macros", "rt-multi-threa
 
 [dev-dependencies]
 ctrlc                       = "3.4"
-metrics-exporter-prometheus = "0.17"
+metrics-exporter-prometheus = "0.18"
 tokio                       = { version = "1", features = ["full"] }
 
 [features]
