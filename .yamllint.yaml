@@ -4,6 +4,8 @@ rules:
   comments:
     min-spaces-from-content: 1
   document-start: disable
+  line-length:
+    max: 110
   truthy:
     allowed-values:
       - 'true'
