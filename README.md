@@ -44,13 +44,13 @@ metrics_ipc_collector = "0.1.0"
 
 ### Listener Example
 
-The listener sets up the `IPCCollector` to gather metrics from IPC sockets and
+The listener sets up the `IPCSocketCollector` to gather metrics from IPC sockets and
 uses the Prometheus exporter to expose them via an HTTP endpoint. The example
 also handles termination signals (e.g., Ctrl+C) for clean shutdown.
 
 ```rust
 use metrics_exporter_prometheus::PrometheusBuilder;
-use metrics_ipc_collector::IPCCollector;
+use metrics_ipc_collector::IPCSocketCollector;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -62,8 +62,8 @@ fn main() {
         .install()
         .expect("Failed to install Prometheus recorder");
 
-    // Set up the IPCCollector.
-    let collector = IPCCollector::default();
+    // Set up the IPCSocketCollector.
+    let collector = IPCSocketCollector::default();
     if let Err(e) = collector.start_collecting() {
         eprintln!("Failed to start metrics collector: {}", e);
     }
@@ -91,7 +91,7 @@ fn main() {
 ### Sender Example
 
 The sender example demonstrates how to record metrics such as counters, gauges,
-and histograms, and send them to an IPC socket using `IPCRecorderBuilder`.
+and histograms, and send them to an IPC socket using `IPCSocketRecorderBuilder`.
 
 ```rust
 use metrics::{counter, gauge, histogram};
@@ -155,12 +155,68 @@ A pipe created elsewhere can be wrapped with
   sent every interval, and again when the recorder is dropped. A global
   recorder is never dropped, so the last interval before exit may be lost.
 
+## Socket addresses
+
+Collectors and recorders must use the same address:
+
+- `.socket(name)` (default `metrics_collector.sock`) is a namespaced name:
+  - Linux and Android: the abstract socket namespace, with no file.
+  - Other Unix: a socket file in `/run/user/<uid>` if it exists, otherwise
+    in `/tmp`.
+  - Windows: the named pipe `\\.\pipe\<name>`.
+- `.path(path)` is a socket file at an explicit path. On Windows it must be a
+  named pipe path.
+
+On startup, the collector refuses to start if another collector is already
+answering on the address. It replaces stale socket files left by a crash. For
+`.path()` addresses it only ever removes socket files: anything else at the
+path is reported as an error.
+
 ## Wire format
 
-Each event is a big-endian `u32` length followed by a MessagePack payload.
-Collectors and recorders must use the same crate version: 0.5 cannot talk to
-0.4, which used newline-delimited frames. Those broke whenever an encoded
-value contained a `0x0a` byte.
+Each event is framed as:
+
+| bytes | meaning                                           |
+|-------|---------------------------------------------------|
+| 0     | `0xC1`, a byte MessagePack never produces         |
+| 1     | wire version, currently `1`                       |
+| 2..6  | big-endian `u32` payload length                   |
+| 6..   | MessagePack-encoded event                         |
+
+A collector drops a stream whose header does not match, with an error
+logged. Senders from 0.4 and earlier, which used newline-delimited frames,
+are reported as "the sender may be using an older version". Upgrade
+collectors and senders together.
+
+## Security
+
+Everything a sender writes is trusted. Any process that can reach the
+collector can create, change or overwrite metrics, and can grow memory use by
+creating many distinct metrics or label values. Collector labels set with
+`with_label` override the sender's value for that label only.
+
+Who can reach the collector depends on the transport:
+
+- **Unnamed pipes (`IPCPipeCollector`)**: only processes holding the pipe's
+  sending handle. This is the safest option when you spawn the senders
+  yourself.
+- **Linux namespaced sockets (`.socket(name)`)**: the abstract namespace has
+  no permission checks. Every process in the same network namespace can
+  connect, and any process can claim the name first if the collector is not
+  yet running.
+- **Other Unix namespaced sockets**: a socket file in `/run/user/<uid>`, which
+  is private to the user, or in the shared `/tmp`, where access follows the
+  socket file's permissions (set by the process umask) and other users can
+  claim the name first.
+- **`.path(path)` sockets**: normal file permissions. Put the socket in a
+  directory only the intended users can access, for example a `0700`
+  directory owned by the service user.
+- **Windows named pipes**: the pipe is created with the default named pipe
+  security descriptor. Check that it matches your requirements before
+  relying on it across user accounts.
+
+Frames larger than 16 MiB are rejected, so a single malformed or hostile
+frame cannot force a large allocation.
 
 ## License
 

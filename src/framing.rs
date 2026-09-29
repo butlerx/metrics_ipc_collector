@@ -1,8 +1,17 @@
 //! Length-prefixed framing for metric events.
 //!
-//! Each frame is a big-endian `u32` payload length followed by a `MessagePack`
-//! encoded [`MetricEvent`]. Binary payloads can contain any byte, so delimiter
-//! based framing is not safe.
+//! Each frame is a 6 byte header followed by a `MessagePack` encoded
+//! [`MetricEvent`]:
+//!
+//! | bytes | meaning                                        |
+//! |-------|------------------------------------------------|
+//! | 0     | [`MAGIC`], a byte `MessagePack` never produces |
+//! | 1     | [`WIRE_VERSION`]                               |
+//! | 2..6  | big-endian `u32` payload length                |
+//!
+//! Binary payloads can contain any byte, so delimiter based framing is not
+//! safe. The magic byte makes streams from 0.4 and earlier, which start with a
+//! `MessagePack` map, fail with a clear error instead of garbage.
 
 use crate::{error::MetricsError, events::MetricEvent};
 #[cfg(any(not(feature = "tokio"), test))]
@@ -15,7 +24,13 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 /// length prefix is corrupt.
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 
-const HEADER_LEN: usize = 4;
+/// First byte of every frame. `0xC1` is reserved and never used by `MessagePack`.
+pub const MAGIC: u8 = 0xC1;
+
+/// Version of the frame and event encoding. Bump on any incompatible change.
+pub const WIRE_VERSION: u8 = 1;
+
+const HEADER_LEN: usize = 6;
 
 /// Encodes an event into a complete frame, header included.
 pub fn encode(event: &MetricEvent) -> Result<Vec<u8>, MetricsError> {
@@ -26,13 +41,27 @@ pub fn encode(event: &MetricEvent) -> Result<Vec<u8>, MetricsError> {
         .ok_or(MetricsError::FrameTooLarge(payload.len()))?;
 
     let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
+    frame.extend_from_slice(&[MAGIC, WIRE_VERSION]);
     frame.extend_from_slice(&len.to_be_bytes());
     frame.extend_from_slice(&payload);
     Ok(frame)
 }
 
 fn payload_len(header: [u8; HEADER_LEN]) -> io::Result<usize> {
-    let len = u32::from_be_bytes(header) as usize;
+    let [magic, version, len @ ..] = header;
+    if magic != MAGIC {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "not a metrics_ipc_collector 0.5+ stream; the sender may be using an older version",
+        ));
+    }
+    if version != WIRE_VERSION {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("unsupported wire version {version}, expected {WIRE_VERSION}"),
+        ));
+    }
+    let len = u32::from_be_bytes(len) as usize;
     if len > MAX_FRAME_LEN {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
@@ -176,11 +205,37 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
     }
 
+    fn read_error(bytes: Vec<u8>) -> io::Error {
+        let mut buffer = Vec::new();
+        read_frame(&mut Cursor::new(bytes), &mut buffer).unwrap_err()
+    }
+
     #[test]
     fn oversized_length_prefix_is_rejected() {
-        let header = u32::try_from(MAX_FRAME_LEN + 1).unwrap().to_be_bytes();
-        let mut buffer = Vec::new();
-        let err = read_frame(&mut Cursor::new(header.to_vec()), &mut buffer).unwrap_err();
+        let mut header = vec![MAGIC, WIRE_VERSION];
+        header.extend(u32::try_from(MAX_FRAME_LEN + 1).unwrap().to_be_bytes());
+        assert_eq!(read_error(header).kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn old_newline_delimited_streams_are_rejected() {
+        // 0.4 wrote a bare MessagePack map followed by a newline.
+        let mut old: Vec<u8> = (&event(MetricOperation::SetCounter(1))).try_into().unwrap();
+        old.push(b'\n');
+        let err = read_error(old);
         assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("older version"), "{err}");
+    }
+
+    #[test]
+    fn unknown_wire_versions_are_rejected() {
+        let mut frame = encode(&event(MetricOperation::SetCounter(1))).unwrap();
+        frame[1] = WIRE_VERSION + 1;
+        let err = read_error(frame);
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("unsupported wire version"),
+            "{err}"
+        );
     }
 }

@@ -5,7 +5,7 @@
 //! The example includes recording a counter, a gauge, and a histogram metric to illustrate the usage of the `IPCSocketRecorderBuilder`.
 
 fn main() {
-    // Create an IPCRecorderBuilder and configure the socket path.
+    // Create an IPCSocketRecorderBuilder and configure the socket path.
     let builder = metrics_ipc_collector::IPCSocketRecorderBuilder::default();
 
     // Attempt to build the IPC recorder and set it as the global recorder.

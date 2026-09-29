@@ -1,7 +1,7 @@
 use super::core::{Core, RecorderConfig, delegate_recorder, sync_core};
-use crate::error::MetricsError;
-use interprocess::local_socket::{GenericFilePath, GenericNamespaced, prelude::*};
-use std::time::Duration;
+use crate::{error::MetricsError, socket_addr::SocketAddr};
+use interprocess::local_socket::prelude::*;
+use std::{path::PathBuf, time::Duration};
 
 /// An IPC recorder.
 ///
@@ -31,26 +31,29 @@ impl IPCSocketRecorder {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct IPCSocketRecorderBuilder {
-    socket_path: String,
+    addr: SocketAddr,
     config: RecorderConfig,
 }
 
-impl Default for IPCSocketRecorderBuilder {
-    fn default() -> Self {
-        Self {
-            socket_path: "metrics_collector.sock".into(),
-            config: RecorderConfig::default(),
-        }
-    }
-}
-
 impl IPCSocketRecorderBuilder {
-    /// Sets the path for the IPC socket file.
+    /// Connects to a namespaced socket name. Defaults to `metrics_collector.sock`.
+    ///
+    /// Must match [`IPCSocketCollector::socket`](crate::IPCSocketCollector::socket),
+    /// which describes how names map to each platform.
     #[must_use]
-    pub fn socket(mut self, socket_path: &str) -> Self {
-        self.socket_path = socket_path.to_string();
+    pub fn socket(mut self, name: impl Into<String>) -> Self {
+        self.addr = SocketAddr::Namespaced(name.into());
+        self
+    }
+
+    /// Connects to a socket file at `path`, replacing [`socket`](Self::socket).
+    ///
+    /// Must match [`IPCSocketCollector::path`](crate::IPCSocketCollector::path).
+    #[must_use]
+    pub fn path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.addr = SocketAddr::Path(path.into());
         self
     }
 
@@ -75,19 +78,12 @@ impl IPCSocketRecorderBuilder {
     /// # Errors
     /// Returns an error if the IPC connection cannot be established.
     pub fn build_recorder(self) -> Result<IPCSocketRecorder, MetricsError> {
-        let socket_name = if GenericNamespaced::is_supported() {
-            self.socket_path.to_ns_name::<GenericNamespaced>()?
-        } else {
-            let socket_path = self.socket_path;
-            format!("/tmp/{socket_path}").to_fs_name::<GenericFilePath>()?
-        };
-
-        let stream = LocalSocketStream::connect(socket_name)?;
+        let stream = LocalSocketStream::connect(self.addr.to_name()?)?;
         Ok(IPCSocketRecorder::with_config(stream, self.config))
     }
 
     /// Builds the IPC recorder and sets it as the global recorder.
-    /// This function connects to the IPC socket specified by `socket_path` and sets up the recorder.
+    /// This function connects to the configured IPC socket and sets up the recorder.
     /// All metrics recorded after this call will be sent to the IPC socket.
     ///
     /// # Example

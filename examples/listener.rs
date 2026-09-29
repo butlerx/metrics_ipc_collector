@@ -21,7 +21,7 @@ async fn main() {
         .install()
         .expect("Failed to install Prometheus recorder");
 
-    // Set up the IPCCollector.
+    // Set up the IPCSocketCollector.
     let collector = metrics_ipc_collector::IPCSocketCollector::default();
     if let Err(e) = collector.start_collecting() {
         eprintln!("Failed to start metrics collector: {e}");
@@ -44,7 +44,7 @@ fn main() {
         .install()
         .expect("Failed to install Prometheus recorder");
 
-    // Set up the IPCCollector.
+    // Set up the IPCSocketCollector.
     let collector = metrics_ipc_collector::IPCSocketCollector::default();
     if let Err(e) = collector.start_collecting() {
         eprintln!("Failed to start metrics collector: {e}");

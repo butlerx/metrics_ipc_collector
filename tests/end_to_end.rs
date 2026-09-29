@@ -291,3 +291,107 @@ mod async_io {
         }
     }
 }
+
+/// Socket address handling, run in both blocking and Tokio modes.
+#[cfg(unix)]
+mod socket_addresses {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Runs `f` with a Tokio runtime entered when the `tokio` feature is on.
+    fn with_runtime<T>(f: impl FnOnce() -> T) -> T {
+        #[cfg(feature = "tokio")]
+        {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _guard = runtime.enter();
+            f()
+        }
+        #[cfg(not(feature = "tokio"))]
+        f()
+    }
+
+    fn temp_socket(name: &str) -> PathBuf {
+        let mode = if cfg!(feature = "tokio") {
+            "tokio"
+        } else {
+            "blocking"
+        };
+        let path =
+            std::env::temp_dir().join(format!("mipc-{}-{mode}-{name}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn path_sockets_round_trip() {
+        prometheus();
+        let path = temp_socket("round-trip");
+        with_runtime(|| {
+            let _handle = IPCSocketCollector::default()
+                .path(&path)
+                .start_collecting()
+                .unwrap();
+            let recorder = IPCSocketRecorderBuilder::default()
+                .path(&path)
+                .build_recorder()
+                .unwrap();
+            metrics::with_local_recorder(&recorder, || {
+                metrics::counter!("e2e_path_total").absolute(10);
+            });
+            wait_for(&["e2e_path_total 10"]);
+            // A second event after the reader has drained the socket catches
+            // readers that were left in non-blocking mode.
+            metrics::with_local_recorder(&recorder, || {
+                metrics::counter!("e2e_path_total").increment(5);
+            });
+            wait_for(&["e2e_path_total 15"]);
+        });
+    }
+
+    #[test]
+    fn stale_socket_files_are_replaced() {
+        let path = temp_socket("stale");
+        // A std listener leaves its socket file behind when dropped, like a
+        // collector that crashed.
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        assert!(path.exists());
+
+        with_runtime(|| {
+            IPCSocketCollector::default()
+                .path(&path)
+                .start_collecting()
+                .expect("a stale socket file should be replaced");
+        });
+    }
+
+    #[test]
+    fn live_collectors_are_not_taken_over() {
+        let path = temp_socket("live");
+        with_runtime(|| {
+            let _first = IPCSocketCollector::default()
+                .path(&path)
+                .start_collecting()
+                .unwrap();
+            let err = IPCSocketCollector::default()
+                .path(&path)
+                .start_collecting()
+                .expect_err("a second collector should not take over a live socket");
+            assert!(err.to_string().contains("already listening"), "{err}");
+        });
+    }
+
+    #[test]
+    fn regular_files_are_not_deleted() {
+        let path = temp_socket("regular-file");
+        std::fs::write(&path, b"not a socket").unwrap();
+
+        let result = with_runtime(|| IPCSocketCollector::default().path(&path).start_collecting());
+        let still_there = std::fs::read(&path).ok();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(still_there.as_deref(), Some(&b"not a socket"[..]));
+        assert!(result.is_err());
+    }
+}

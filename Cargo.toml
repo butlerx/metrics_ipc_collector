@@ -11,7 +11,7 @@ categories  = ["development-tools::debugging"]
 keywords    = ["interprocess", "ipc", "metrics", "pipe", "telemetry"]
 
 [dependencies]
-interprocess = "2.2"
+interprocess = "2.4"
 log          = "0.4"
 metrics      = "0.24"
 rmp-serde    = "1.3"

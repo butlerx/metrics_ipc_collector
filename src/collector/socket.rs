@@ -2,12 +2,12 @@ use super::{
     handle::{CollectorHandle, StopSignal},
     handlers::{ExtraLabels, handle_frame},
 };
-use crate::{error::MetricsError, framing};
+use crate::{error::MetricsError, framing, socket_addr::SocketAddr};
+use interprocess::local_socket::ListenerOptions;
 #[cfg(feature = "tokio")]
-use interprocess::local_socket::tokio::prelude::*;
-use interprocess::local_socket::{GenericFilePath, GenericNamespaced, ListenerOptions};
+use interprocess::local_socket::tokio::{Listener, prelude::*};
 #[cfg(not(feature = "tokio"))]
-use interprocess::local_socket::{ListenerNonblockingMode, Stream, prelude::*};
+use interprocess::local_socket::{Listener, ListenerNonblockingMode, Stream, prelude::*};
 use std::path::PathBuf;
 #[cfg(not(feature = "tokio"))]
 use std::{io::BufReader, thread, time::Duration};
@@ -18,25 +18,58 @@ use tokio::{io::BufReader, runtime::Handle as TokioHandle, task};
 #[cfg(not(feature = "tokio"))]
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Collects metrics sent by [`IPCSocketRecorder`](crate::IPCSocketRecorder)s
+/// over a local socket.
+///
+/// # Security
+/// Any process that can connect to the socket can create, change and overwrite
+/// metrics. Which processes can connect depends on the address:
+///
+/// - [`socket`](Self::socket) names on Linux live in the abstract namespace,
+///   which has no permission checks: every process in the same network
+///   namespace can connect.
+/// - [`socket`](Self::socket) names on other Unix systems are files in
+///   `/run/user/<uid>` if it exists, otherwise in the shared `/tmp`.
+/// - [`path`](Self::path) sockets follow normal file permissions, so put them
+///   in a directory only the intended users can access.
+///
+/// If you spawn the senders yourself, prefer [`IPCPipeCollector`](crate::IPCPipeCollector):
+/// only processes holding the pipe handle can write to it. See the README for
+/// more detail.
+#[derive(Default)]
 pub struct IPCSocketCollector {
-    socket_path: String,
+    addr: SocketAddr,
     labels: Vec<(String, String)>,
 }
 
-impl Default for IPCSocketCollector {
-    fn default() -> Self {
-        Self {
-            socket_path: "metrics_collector.sock".into(),
-            labels: Vec::new(),
-        }
-    }
-}
-
 impl IPCSocketCollector {
-    /// Sets the path for the IPC socket file.
+    /// Listens on a namespaced socket name. Defaults to `metrics_collector.sock`.
+    ///
+    /// - **Linux and Android:** the abstract socket namespace. No file is
+    ///   created.
+    /// - **Other Unix:** a socket file named `name` in `/run/user/<uid>` if
+    ///   that directory exists, otherwise in `/tmp`.
+    /// - **Windows:** the named pipe `\\.\pipe\<name>`.
+    ///
+    /// The recorder must use the same name with
+    /// [`IPCSocketRecorderBuilder::socket`](crate::IPCSocketRecorderBuilder::socket).
     #[must_use]
-    pub fn socket(mut self, socket_path: &str) -> Self {
-        self.socket_path = socket_path.to_string();
+    pub fn socket(mut self, name: impl Into<String>) -> Self {
+        self.addr = SocketAddr::Namespaced(name.into());
+        self
+    }
+
+    /// Listens on a socket file at `path`, replacing [`socket`](Self::socket).
+    ///
+    /// On Unix this is a Unix domain socket file; access follows the file and
+    /// directory permissions. On Windows the path must be a named pipe path
+    /// such as `\\.\pipe\metrics`.
+    ///
+    /// The recorder must use the same path with
+    /// [`IPCSocketRecorderBuilder::path`](crate::IPCSocketRecorderBuilder::path).
+    #[must_use]
+    pub fn path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.addr = SocketAddr::Path(path.into());
         self
     }
 
@@ -63,11 +96,14 @@ impl IPCSocketCollector {
         })
     }
 
-    /// Sets up the IPC collector to start collecting metrics from the specified socket.
-    /// This function spawns a thread/task that listens for incoming connections on the socket and
-    /// processes metric events.
+    /// Starts listening and spawns a thread/task that processes metric events
+    /// from every connection.
     /// The metrics collected can then be exported using any of the regular metric export crates.
-    /// If the socket file already exists, it will be removed before starting the collector.
+    ///
+    /// On Unix, a stale socket file left by a collector that did not shut down
+    /// cleanly is replaced. With [`path`](Self::path), anything at the path
+    /// that is not a socket is left alone and reported as an error. The socket
+    /// file is removed when the collector stops.
     ///
     /// The collector runs until [`CollectorHandle::stop`] is called.
     ///
@@ -80,64 +116,112 @@ impl IPCSocketCollector {
     /// ```
     ///
     /// # Errors
-    /// This function will return an error if it fails to create the socket file or if there are issues
-    /// with the IPC communication.
+    /// Returns an error if the socket cannot be created, for example because
+    /// another collector is already listening on it. With the `tokio` feature
+    /// enabled, this also returns an error when called outside a Tokio runtime.
     pub fn start_collecting(self) -> Result<CollectorHandle, MetricsError> {
-        #[cfg(feature = "tokio")]
-        let runtime = TokioHandle::try_current().map_err(|_| MetricsError::TokioRuntimeRequired)?;
-
-        let socket_path = self.socket_path;
-        let socket_file: PathBuf = format!("/tmp/{socket_path}").into();
-        if socket_file.exists() {
-            std::fs::remove_file(&socket_file)?;
-        }
+        ensure_not_listening(&self.addr)?;
+        // Nobody answered, so an existing socket at the address is stale.
+        let options = ListenerOptions::new().name(self.addr.to_name()?);
+        let options = match &self.addr {
+            SocketAddr::Path(path) => {
+                remove_stale_socket(path)?;
+                options
+            }
+            // Namespaced names only become files on non-Linux Unix, in a
+            // location chosen by interprocess, so let it replace them.
+            SocketAddr::Namespaced(_) => options.try_overwrite(true),
+        };
         let labels: ExtraLabels = self.labels.into();
 
         #[cfg(not(feature = "tokio"))]
-        let handle = CollectorHandle::spawn(move |stop| {
-            if let Err(e) = run_collector(&socket_path, &labels, &stop) {
-                log::error!("Metrics collector error: {e}");
-            }
-            // Clean up socket file on shutdown
-            let _ = std::fs::remove_file(&socket_file);
-        })?;
+        {
+            let listener = options.create_sync()?;
+            // Non-blocking accepts let the loop notice stop requests.
+            listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
+            CollectorHandle::spawn(move |stop| run_collector(&listener, &labels, &stop))
+                .map_err(Into::into)
+        }
 
         #[cfg(feature = "tokio")]
-        let handle = CollectorHandle::spawn(&runtime, move |stop| async move {
-            if let Err(e) = run_collector(&socket_path, labels, stop).await {
-                log::error!("Metrics collector error: {e}");
-            }
-            // Clean up socket file on shutdown
-            let _ = std::fs::remove_file(&socket_file);
-        });
-
-        Ok(handle)
+        {
+            let runtime =
+                TokioHandle::try_current().map_err(|_| MetricsError::TokioRuntimeRequired)?;
+            let listener = {
+                let _guard = runtime.enter();
+                options.create_tokio()?
+            };
+            Ok(CollectorHandle::spawn(&runtime, move |stop| {
+                run_collector(listener, labels, stop)
+            }))
+        }
     }
 }
 
-fn socket_name(socket_path: &str) -> std::io::Result<interprocess::local_socket::Name<'static>> {
-    if GenericNamespaced::is_supported() {
-        socket_path.to_string().to_ns_name::<GenericNamespaced>()
+/// Fails if a live collector already answers on `addr`.
+///
+/// `try_overwrite` deletes an existing socket file without checking whether
+/// its listener is still alive, which would silently take over another
+/// collector's socket.
+fn ensure_not_listening(addr: &SocketAddr) -> std::io::Result<()> {
+    use interprocess::local_socket::traits::Stream as _;
+
+    match interprocess::local_socket::Stream::connect(addr.to_name()?) {
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            format!("another metrics collector is already listening on {addr}"),
+        )),
+        Err(_) => Ok(()),
+    }
+}
+
+/// Removes a leftover socket file at `path`, refusing to touch anything that
+/// is not a socket.
+fn remove_stale_socket(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(path),
+            Ok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("{} exists and is not a socket", path.display()),
+            )),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+    // Named pipes disappear with their last handle, so nothing is left over.
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Logs why a connection ended. Wire errors are worth surfacing; ordinary
+/// disconnects are not.
+fn log_connection_error(e: &std::io::Error) {
+    if e.kind() == std::io::ErrorKind::InvalidData {
+        log::warn!("Dropping metrics connection: {e}");
     } else {
-        format!("/tmp/{socket_path}").to_fs_name::<GenericFilePath>()
+        log::debug!("Dropping metrics connection: {e}");
     }
 }
 
 #[cfg(not(feature = "tokio"))]
-fn run_collector(
-    socket_path: &str,
-    labels: &ExtraLabels,
-    stop: &StopSignal,
-) -> Result<(), MetricsError> {
-    let listener = ListenerOptions::new()
-        .name(socket_name(socket_path)?)
-        .create_sync()?;
-    // Non-blocking accepts let the loop notice stop requests.
-    listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
-
+fn run_collector(listener: &Listener, labels: &ExtraLabels, stop: &StopSignal) {
     while !stop.is_stopped() {
         match listener.accept() {
             Ok(stream) => {
+                // On macOS and the BSDs, accepted sockets inherit the
+                // listener's non-blocking flag; the reader thread needs
+                // blocking reads.
+                if let Err(e) = stream.set_nonblocking(false) {
+                    log::debug!("Dropping metrics connection: {e}");
+                    continue;
+                }
                 let labels = labels.clone();
                 let stop = stop.clone();
                 thread::spawn(move || read_connection(stream, &labels, &stop));
@@ -148,7 +232,6 @@ fn run_collector(
             Err(e) => log::debug!("Failed to accept metrics connection: {e}"),
         }
     }
-    Ok(())
 }
 
 #[cfg(not(feature = "tokio"))]
@@ -162,7 +245,7 @@ fn read_connection(stream: Stream, labels: &ExtraLabels, stop: &StopSignal) {
             Ok(true) => handle_frame(&buffer, labels),
             Ok(false) => break,
             Err(e) => {
-                log::debug!("Dropping metrics connection: {e}");
+                log_connection_error(&e);
                 break;
             }
         }
@@ -170,14 +253,7 @@ fn read_connection(stream: Stream, labels: &ExtraLabels, stop: &StopSignal) {
 }
 
 #[cfg(feature = "tokio")]
-async fn run_collector(
-    socket_path: &str,
-    labels: ExtraLabels,
-    mut stop: StopSignal,
-) -> Result<(), MetricsError> {
-    let listener = ListenerOptions::new()
-        .name(socket_name(socket_path)?)
-        .create_tokio()?;
+async fn run_collector(listener: Listener, labels: ExtraLabels, mut stop: StopSignal) {
     let mut connections = task::JoinSet::new();
 
     loop {
@@ -196,7 +272,6 @@ async fn run_collector(
     }
 
     connections.shutdown().await;
-    Ok(())
 }
 
 #[cfg(feature = "tokio")]
@@ -212,7 +287,7 @@ async fn read_connection(stream: LocalSocketStream, labels: ExtraLabels, mut sto
                 Ok(true) => handle_frame(&buffer, &labels),
                 Ok(false) => break,
                 Err(e) => {
-                    log::debug!("Dropping metrics connection: {e}");
+                    log_connection_error(&e);
                     break;
                 }
             },
