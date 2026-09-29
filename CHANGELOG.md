@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/butlerx/metrics_ipc_collector/compare/v0.5.0...v0.5.1) (2026-09-29)
+
+
+### Bug Fixes
+
+* send counters as increments and arbitrate replaced senders ([4a05612](https://github.com/butlerx/metrics_ipc_collector/commit/4a0561258fde0dd683743dddb84154abdc5cffff))
+
 ## [0.5.0](https://github.com/butlerx/metrics_ipc_collector/compare/v0.4.1...v0.5.0) (2026-09-29)
 
 
