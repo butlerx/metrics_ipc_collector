@@ -1,169 +1,47 @@
-use crate::{
-    error::MetricsError,
-    events::{MetricData, MetricEvent, MetricKind, MetricMetadata, MetricOperation},
-};
+use super::core::{Core, RecorderConfig, delegate_recorder, sync_core};
+use crate::error::MetricsError;
 use interprocess::local_socket::{GenericFilePath, GenericNamespaced, prelude::*};
-use std::{
-    collections::BTreeMap,
-    io::Write,
-    sync::{Arc, Mutex},
-};
-
-fn write_event(
-    stream: &Arc<Mutex<LocalSocketStream>>,
-    event: MetricEvent,
-) -> Result<(), MetricsError> {
-    let bytes: Vec<u8> = event.try_into()?;
-    let mut stream = stream.lock().unwrap();
-    stream.write_all(&bytes)?;
-    stream.write_all(b"\n")?;
-    stream.flush().map_err(Into::into)
-}
-
-#[derive(Debug)]
-struct Handle {
-    key: metrics::Key,
-    stream: Arc<Mutex<LocalSocketStream>>,
-}
-
-impl Handle {
-    const fn new(key: metrics::Key, stream: Arc<Mutex<LocalSocketStream>>) -> Self {
-        Self { key, stream }
-    }
-
-    fn push_metric(&self, key: &metrics::Key, op: MetricOperation) {
-        let metric = MetricData {
-            name: key.name().to_string(),
-            labels: key
-                .labels()
-                .map(|label| (label.key().to_owned(), label.value().to_owned()))
-                .collect::<BTreeMap<_, _>>(),
-            operation: op,
-        };
-        let _ = write_event(&self.stream.clone(), MetricEvent::Metric(metric));
-    }
-}
-
-impl metrics::CounterFn for Handle {
-    fn increment(&self, value: u64) {
-        self.push_metric(&self.key, MetricOperation::IncrementCounter(value));
-    }
-
-    fn absolute(&self, value: u64) {
-        self.push_metric(&self.key, MetricOperation::SetCounter(value));
-    }
-}
-
-impl metrics::GaugeFn for Handle {
-    fn increment(&self, value: f64) {
-        self.push_metric(&self.key, MetricOperation::IncrementGauge(value));
-    }
-
-    fn decrement(&self, value: f64) {
-        self.push_metric(&self.key, MetricOperation::DecrementGauge(value));
-    }
-
-    fn set(&self, value: f64) {
-        self.push_metric(&self.key, MetricOperation::SetGauge(value));
-    }
-}
-
-impl metrics::HistogramFn for Handle {
-    fn record(&self, value: f64) {
-        self.push_metric(&self.key, MetricOperation::RecordHistogram(value));
-    }
-}
+use std::time::Duration;
 
 /// An IPC recorder.
+///
+/// Each update is written to the socket before the call returns, and blocks if
+/// the collector is not keeping up. Use
+/// [`flush_interval`](IPCSocketRecorderBuilder::flush_interval) to replace
+/// per-update IO with periodic batches.
 #[derive(Debug, Clone)]
 pub struct IPCSocketRecorder {
-    stream: Arc<Mutex<LocalSocketStream>>,
+    core: Core,
 }
+
+delegate_recorder!(IPCSocketRecorder);
 
 impl IPCSocketRecorder {
-    /// Creates a socket recorder backed by an established local socket stream.
+    /// Creates a socket recorder backed by an established local socket stream,
+    /// using default options.
     #[must_use]
     pub fn new(stream: LocalSocketStream) -> Self {
+        Self::with_config(stream, RecorderConfig::default())
+    }
+
+    fn with_config(stream: LocalSocketStream, config: RecorderConfig) -> Self {
         Self {
-            stream: Arc::new(Mutex::new(stream)),
+            core: sync_core(stream, config),
         }
-    }
-
-    fn register_metric(
-        &self,
-        key_name: &metrics::KeyName,
-        kind: MetricKind,
-        unit: Option<metrics::Unit>,
-        description: &metrics::SharedString,
-    ) {
-        let metadata = MetricMetadata {
-            name: key_name.as_str().to_string(),
-            kind,
-            unit: unit.map(|u| u.as_str().to_string()),
-            description: description.to_string(),
-        };
-        let _ = write_event(&self.stream.clone(), MetricEvent::Metadata(metadata));
-    }
-}
-
-impl metrics::Recorder for IPCSocketRecorder {
-    fn describe_counter(
-        &self,
-        key_name: metrics::KeyName,
-        unit: Option<metrics::Unit>,
-        description: metrics::SharedString,
-    ) {
-        self.register_metric(&key_name, MetricKind::Counter, unit, &description);
-    }
-
-    fn describe_gauge(
-        &self,
-        key_name: metrics::KeyName,
-        unit: Option<metrics::Unit>,
-        description: metrics::SharedString,
-    ) {
-        self.register_metric(&key_name, MetricKind::Gauge, unit, &description);
-    }
-
-    fn describe_histogram(
-        &self,
-        key_name: metrics::KeyName,
-        unit: Option<metrics::Unit>,
-        description: metrics::SharedString,
-    ) {
-        self.register_metric(&key_name, MetricKind::Histogram, unit, &description);
-    }
-
-    fn register_counter(
-        &self,
-        key: &metrics::Key,
-        _meta: &metrics::Metadata<'_>,
-    ) -> metrics::Counter {
-        metrics::Counter::from_arc(Arc::new(Handle::new(key.clone(), self.stream.clone())))
-    }
-
-    fn register_gauge(&self, key: &metrics::Key, _meta: &metrics::Metadata<'_>) -> metrics::Gauge {
-        metrics::Gauge::from_arc(Arc::new(Handle::new(key.clone(), self.stream.clone())))
-    }
-
-    fn register_histogram(
-        &self,
-        key: &metrics::Key,
-        _meta: &metrics::Metadata<'_>,
-    ) -> metrics::Histogram {
-        metrics::Histogram::from_arc(Arc::new(Handle::new(key.clone(), self.stream.clone())))
     }
 }
 
 #[derive(Debug)]
 pub struct IPCSocketRecorderBuilder {
     socket_path: String,
+    config: RecorderConfig,
 }
 
 impl Default for IPCSocketRecorderBuilder {
     fn default() -> Self {
         Self {
             socket_path: "metrics_collector.sock".into(),
+            config: RecorderConfig::default(),
         }
     }
 }
@@ -174,6 +52,38 @@ impl IPCSocketRecorderBuilder {
     pub fn socket(mut self, socket_path: &str) -> Self {
         self.socket_path = socket_path.to_string();
         self
+    }
+
+    /// Batches metric updates locally and sends them every `interval`.
+    ///
+    /// Without this, every update is its own IPC message. With it, updates only
+    /// touch an in-process cell: counter increments and gauge changes are
+    /// merged, and histogram samples are sent together. Use this on hot paths.
+    ///
+    /// Pending updates are flushed when the recorder is dropped. A global
+    /// recorder is never dropped, so updates made in the last interval before
+    /// the process exits may be lost.
+    #[must_use]
+    pub const fn flush_interval(mut self, interval: Duration) -> Self {
+        self.config.flush_interval = Some(interval);
+        self
+    }
+
+    /// Connects to the socket and builds the recorder without installing it
+    /// globally.
+    ///
+    /// # Errors
+    /// Returns an error if the IPC connection cannot be established.
+    pub fn build_recorder(self) -> Result<IPCSocketRecorder, MetricsError> {
+        let socket_name = if GenericNamespaced::is_supported() {
+            self.socket_path.to_ns_name::<GenericNamespaced>()?
+        } else {
+            let socket_path = self.socket_path;
+            format!("/tmp/{socket_path}").to_fs_name::<GenericFilePath>()?
+        };
+
+        let stream = LocalSocketStream::connect(socket_name)?;
+        Ok(IPCSocketRecorder::with_config(stream, self.config))
     }
 
     /// Builds the IPC recorder and sets it as the global recorder.
@@ -193,16 +103,6 @@ impl IPCSocketRecorderBuilder {
     ///
     /// Returns an error if the IPC connection cannot be established or if the recorder cannot be set.
     pub fn build(self) -> Result<(), MetricsError> {
-        let socket_name = if GenericNamespaced::is_supported() {
-            self.socket_path.to_ns_name::<GenericNamespaced>()?
-        } else {
-            let socket_path = self.socket_path;
-            format!("/tmp/{socket_path}").to_fs_name::<GenericFilePath>()?
-        };
-
-        let stream = LocalSocketStream::connect(socket_name)?;
-        stream.set_nonblocking(true)?;
-        let recorder = IPCSocketRecorder::new(stream);
-        metrics::set_global_recorder(recorder).map_err(Into::into)
+        metrics::set_global_recorder(self.build_recorder()?).map_err(Into::into)
     }
 }

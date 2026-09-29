@@ -52,6 +52,8 @@ pub enum MetricOperation {
     DecrementGauge(f64),
     SetGauge(f64),
     RecordHistogram(f64),
+    /// Several histogram samples flushed together by a batching recorder.
+    RecordHistogramBatch(Vec<f64>),
 }
 
 /// An event sent over IPC, representing either metric metadata or metric data.
@@ -67,18 +69,18 @@ pub enum MetricEvent {
     Metric(MetricData),
 }
 
-impl TryFrom<&Vec<u8>> for MetricEvent {
+impl TryFrom<&[u8]> for MetricEvent {
     type Error = MetricsError;
 
-    fn try_from(buffer: &Vec<u8>) -> Result<Self, Self::Error> {
+    fn try_from(buffer: &[u8]) -> Result<Self, Self::Error> {
         rmp_serde::from_slice(buffer).map_err(MetricsError::from)
     }
 }
 
-impl TryFrom<MetricEvent> for Vec<u8> {
+impl TryFrom<&MetricEvent> for Vec<u8> {
     type Error = MetricsError;
 
-    fn try_from(event: MetricEvent) -> Result<Self, Self::Error> {
-        rmp_serde::to_vec(&event).map_err(MetricsError::from)
+    fn try_from(event: &MetricEvent) -> Result<Self, Self::Error> {
+        rmp_serde::to_vec(event).map_err(MetricsError::from)
     }
 }

@@ -26,11 +26,14 @@ pub enum MetricsError {
     /// Failed to deserialize metric event.
     #[error("failed to deserialize event: {0}")]
     Deserialization(#[from] rmp_serde::decode::Error),
-    /// The Tokio-backed pipe recorder was created outside a Tokio runtime.
+    /// A Tokio-backed collector or recorder was started outside a Tokio runtime.
     #[cfg(feature = "tokio")]
-    #[error("Tokio runtime required for the async pipe recorder")]
+    #[error("Tokio runtime required when the tokio feature is enabled")]
     TokioRuntimeRequired,
-    /// The pipe collector's receiver was already consumed.
-    #[error("receiver already consumed")]
-    PipeCollectorConsumed,
+    /// An encoded event is larger than the frame limit.
+    #[error("event of {0} bytes exceeds the frame size limit")]
+    FrameTooLarge(usize),
+    /// The collector thread or task panicked.
+    #[error("metrics collector panicked")]
+    CollectorPanicked,
 }
