@@ -73,10 +73,10 @@ const NEWLINE_LINES: &[&str] = &[
 ];
 
 const BATCHED_LINES: &[&str] = &[
-    r#"e2e_batched_total{worker="2"} 1000"#,
-    r#"e2e_batched_inflight{worker="2"} 600"#,
-    r#"e2e_batched_latency_count{worker="2"} 3"#,
-    r#"e2e_batched_latency_sum{worker="2"} 6"#,
+    r#"e2e_batched_total{host="h",worker="2"} 1000"#,
+    r#"e2e_batched_inflight{host="h",worker="2"} 600"#,
+    r#"e2e_batched_latency_count{host="h",worker="2"} 3"#,
+    r#"e2e_batched_latency_sum{host="h",worker="2"} 6"#,
 ];
 
 #[cfg(unix)]
@@ -117,6 +117,7 @@ mod blocking {
             .unwrap();
         let recorder = IPCPipeRecorder::builder(sender)
             .flush_interval(Duration::from_millis(50))
+            .with_label("host", "h")
             .build_recorder()
             .unwrap();
         metrics::with_local_recorder(&recorder, record_batched_updates);
@@ -214,6 +215,7 @@ mod async_io {
             .unwrap();
         let recorder = IPCPipeRecorder::builder(sender)
             .flush_interval(Duration::from_millis(50))
+            .with_label("host", "h")
             .build_recorder()
             .unwrap();
         metrics::with_local_recorder(&recorder, record_batched_updates);
@@ -393,5 +395,81 @@ mod socket_addresses {
         let _ = std::fs::remove_file(&path);
         assert_eq!(still_there.as_deref(), Some(&b"not a socket"[..]));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn recorder_labels_are_sent_once_and_applied() {
+        prometheus();
+        let path = temp_socket("hello");
+        with_runtime(|| {
+            let _handle = IPCSocketCollector::default()
+                .path(&path)
+                .with_label("role", "collector")
+                .start_collecting()
+                .unwrap();
+            let recorder = IPCSocketRecorderBuilder::default()
+                .path(&path)
+                .with_label("worker", "5")
+                .with_label("role", "spoofed")
+                .build_recorder()
+                .unwrap();
+            metrics::with_local_recorder(&recorder, || {
+                metrics::counter!("e2e_hello_total").increment(3);
+            });
+            wait_for(&[r#"e2e_hello_total{role="collector",worker="5"} 3"#]);
+        });
+    }
+
+    #[test]
+    fn recorder_reconnects_after_collector_restart() {
+        prometheus();
+        let path = temp_socket("reconnect");
+        with_runtime(|| {
+            let first = IPCSocketCollector::default()
+                .path(&path)
+                .with_label("generation", "1")
+                .start_collecting()
+                .unwrap();
+            let recorder = IPCSocketRecorderBuilder::default()
+                .path(&path)
+                .internal_metrics(true)
+                .build_recorder()
+                .unwrap();
+            let bump = || {
+                metrics::with_local_recorder(&recorder, || {
+                    metrics::counter!("e2e_reconnect_total").increment(1);
+                });
+            };
+            bump();
+            wait_for(&[r#"e2e_reconnect_total{generation="1"} 1"#]);
+
+            #[cfg(feature = "tokio")]
+            tokio::runtime::Handle::current()
+                .block_on(first.shutdown())
+                .unwrap();
+            #[cfg(not(feature = "tokio"))]
+            first.shutdown().unwrap();
+
+            let _second = IPCSocketCollector::default()
+                .path(&path)
+                .with_label("generation", "2")
+                .start_collecting()
+                .unwrap();
+
+            // Keep recording until the new collector sees updates. The first
+            // update after the restart may go to the old connection.
+            let deadline = Instant::now() + TIMEOUT;
+            loop {
+                bump();
+                let rendered = prometheus().render();
+                if rendered.contains(r#"metrics_ipc_recorder_reconnects_total{generation="2"} 1"#)
+                    && rendered.contains(r#"e2e_reconnect_total{generation="2"}"#)
+                {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "no reconnect in:\n{rendered}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
     }
 }

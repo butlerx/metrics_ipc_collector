@@ -19,7 +19,13 @@ collecting metrics, making it suitable for multi-process applications.
   from handles created elsewhere, for example file descriptors passed to a child
   process by a supervisor.
 - **Per-source labels**: `with_label("worker", "3")` on a collector adds the
-  label to every metric it receives, overriding the sender's value.
+  label to every metric it receives. The same method on a recorder builder
+  labels everything that sender records; the labels are sent once per
+  connection, not with every update.
+- **Reconnect**: socket recorders built with `IPCSocketRecorderBuilder`
+  reconnect when the collector restarts.
+- **Internal metrics**: `internal_metrics(true)` on collectors and recorders
+  reports dropped events, decode errors, reconnects and open connections.
 - **Batching**: `flush_interval(...)` on a recorder builder merges updates
   in-process and sends them periodically, instead of one IPC message per update.
 - **Shutdown**: `start_collecting()` returns a `CollectorHandle` with `stop()`,
@@ -154,6 +160,73 @@ A pipe created elsewhere can be wrapped with
 - **Batching (`flush_interval`):** updates only touch in-process state and are
   sent every interval, and again when the recorder is dropped. A global
   recorder is never dropped, so the last interval before exit may be lost.
+- **Socket reconnect:** when a write fails, a builder-made socket recorder
+  reconnects straight away and resends that write. If the collector is still
+  unreachable, it retries with backoff from 100ms up to 5s and drops updates
+  in the meantime. `IPCSocketRecorder::new(stream)` does not know the
+  address, so it cannot reconnect.
+
+## Labels
+
+A metric's labels are merged in this order, later ones winning:
+
+1. labels on the metric itself, e.g. `counter!("hits", "route" => "/")`
+2. recorder labels from `IPCPipeRecorderBuilder::with_label` or
+   `IPCSocketRecorderBuilder::with_label`
+3. collector labels from `IPCPipeCollector::with_label` or
+   `IPCSocketCollector::with_label`
+
+Recorder labels come from the sender and can be anything it chooses. Use
+collector labels when the value must not be spoofable, such as a worker id
+assigned by the parent process.
+
+## Internal metrics
+
+With `internal_metrics(true)`, the collector records, labelled with its
+collector labels:
+
+| metric | kind | meaning |
+|--------|------|---------|
+| `metrics_ipc_collector_connections` | gauge | open pipes or socket connections |
+| `metrics_ipc_collector_events_total` | counter | events received |
+| `metrics_ipc_collector_decode_errors_total` | counter | frames that could not be decoded and were skipped |
+| `metrics_ipc_collector_stream_errors_total` | counter | streams dropped because of a read or wire-format error |
+
+Recorders with `internal_metrics(true)` send, labelled with their recorder
+labels:
+
+| metric | kind | meaning |
+|--------|------|---------|
+| `metrics_ipc_recorder_dropped_events_total` | counter | updates that could not be delivered |
+| `metrics_ipc_recorder_reconnects_total` | counter | socket reconnections |
+
+A recorder reports its counters with its next successful write, so drops
+during an outage show up once the collector is reachable again.
+
+## Senders that exit
+
+The collector cannot tell the exporter to forget a series, so metrics from a
+sender that exits keep their last value indefinitely. With the Prometheus
+exporter, expire series that stop updating:
+
+```rust
+use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_util::MetricKindMask; // add `metrics-util` to your dependencies
+use std::time::Duration;
+
+PrometheusBuilder::new()
+    .idle_timeout(MetricKindMask::ALL, Some(Duration::from_secs(300)))
+    .install()?;
+```
+
+The timeout also removes series from live senders that simply have not
+changed. In batching mode, an unchanged gauge or counter is not resent, so
+choose a timeout well above the time between updates. Alternatively, have
+senders set their gauges periodically, or restrict the mask, for example to
+`MetricKindMask::GAUGE`.
+
+When a sender restarts, counters it sets with `absolute()` start again from
+zero. Prometheus treats that as a counter reset, and `rate()` handles it.
 
 ## Socket addresses
 

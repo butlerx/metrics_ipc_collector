@@ -95,6 +95,39 @@ impl IPCPipeRecorderBuilder {
         self
     }
 
+    /// Labels every metric from this recorder with `key="value"`.
+    ///
+    /// The labels are sent once per connection rather than with every update.
+    /// They override labels of the same name on individual metrics, and are
+    /// overridden by labels set on the collector.
+    #[must_use]
+    pub fn with_label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.config.set_label(key, value);
+        self
+    }
+
+    /// Adds several labels to every metric from this recorder. See
+    /// [`with_label`](Self::with_label).
+    #[must_use]
+    pub fn with_labels<K, V>(self, labels: impl IntoIterator<Item = (K, V)>) -> Self
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        labels
+            .into_iter()
+            .fold(self, |builder, (key, value)| builder.with_label(key, value))
+    }
+
+    /// Also reports the recorder's own counters to the collector:
+    /// `metrics_ipc_recorder_dropped_events_total` and
+    /// `metrics_ipc_recorder_reconnects_total`. Off by default.
+    #[must_use]
+    pub const fn internal_metrics(mut self, enabled: bool) -> Self {
+        self.config.internal_metrics = enabled;
+        self
+    }
+
     /// Builds the recorder without installing it globally.
     ///
     /// Useful for layering or for `metrics::with_local_recorder`.
@@ -108,7 +141,10 @@ impl IPCPipeRecorderBuilder {
     )]
     pub fn build_recorder(self) -> Result<IPCPipeRecorder, MetricsError> {
         #[cfg(not(feature = "tokio"))]
-        let core = super::core::sync_core(self.sender, self.config);
+        let core = super::core::sync_core(
+            Box::new(super::transport::PlainTransport(self.sender)),
+            &self.config,
+        );
 
         #[cfg(feature = "tokio")]
         let core = {

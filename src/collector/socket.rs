@@ -1,6 +1,6 @@
 use super::{
     handle::{CollectorHandle, StopSignal},
-    handlers::{ExtraLabels, handle_frame},
+    handlers::{CollectorOptions, StreamState},
 };
 use crate::{error::MetricsError, framing, socket_addr::SocketAddr};
 use interprocess::local_socket::ListenerOptions;
@@ -40,6 +40,7 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub struct IPCSocketCollector {
     addr: SocketAddr,
     labels: Vec<(String, String)>,
+    internal_metrics: bool,
 }
 
 impl IPCSocketCollector {
@@ -96,6 +97,17 @@ impl IPCSocketCollector {
         })
     }
 
+    /// Also records the collector's own metrics, labelled with the collector
+    /// labels. The connections gauge counts open connections: `metrics_ipc_collector_events_total`,
+    /// `metrics_ipc_collector_decode_errors_total`,
+    /// `metrics_ipc_collector_stream_errors_total` and the
+    /// `metrics_ipc_collector_connections` gauge. Off by default.
+    #[must_use]
+    pub const fn internal_metrics(mut self, enabled: bool) -> Self {
+        self.internal_metrics = enabled;
+        self
+    }
+
     /// Starts listening and spawns a thread/task that processes metric events
     /// from every connection.
     /// The metrics collected can then be exported using any of the regular metric export crates.
@@ -132,14 +144,14 @@ impl IPCSocketCollector {
             // location chosen by interprocess, so let it replace them.
             SocketAddr::Namespaced(_) => options.try_overwrite(true),
         };
-        let labels: ExtraLabels = self.labels.into();
+        let collector_options = CollectorOptions::new(self.labels, self.internal_metrics);
 
         #[cfg(not(feature = "tokio"))]
         {
             let listener = options.create_sync()?;
             // Non-blocking accepts let the loop notice stop requests.
             listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
-            CollectorHandle::spawn(move |stop| run_collector(&listener, &labels, &stop))
+            CollectorHandle::spawn(move |stop| run_collector(&listener, &collector_options, &stop))
                 .map_err(Into::into)
         }
 
@@ -152,7 +164,7 @@ impl IPCSocketCollector {
                 options.create_tokio()?
             };
             Ok(CollectorHandle::spawn(&runtime, move |stop| {
-                run_collector(listener, labels, stop)
+                run_collector(listener, collector_options, stop)
             }))
         }
     }
@@ -211,7 +223,7 @@ fn log_connection_error(e: &std::io::Error) {
 }
 
 #[cfg(not(feature = "tokio"))]
-fn run_collector(listener: &Listener, labels: &ExtraLabels, stop: &StopSignal) {
+fn run_collector(listener: &Listener, options: &CollectorOptions, stop: &StopSignal) {
     while !stop.is_stopped() {
         match listener.accept() {
             Ok(stream) => {
@@ -222,9 +234,9 @@ fn run_collector(listener: &Listener, labels: &ExtraLabels, stop: &StopSignal) {
                     log::debug!("Dropping metrics connection: {e}");
                     continue;
                 }
-                let labels = labels.clone();
+                let options = options.clone();
                 let stop = stop.clone();
-                thread::spawn(move || read_connection(stream, &labels, &stop));
+                thread::spawn(move || read_connection(stream, options, &stop));
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(ACCEPT_POLL_INTERVAL);
@@ -235,17 +247,19 @@ fn run_collector(listener: &Listener, labels: &ExtraLabels, stop: &StopSignal) {
 }
 
 #[cfg(not(feature = "tokio"))]
-fn read_connection(stream: Stream, labels: &ExtraLabels, stop: &StopSignal) {
+fn read_connection(stream: Stream, options: CollectorOptions, stop: &StopSignal) {
     let mut reader = BufReader::new(stream);
     let mut buffer: Vec<u8> = Vec::new();
+    let mut state = StreamState::new(options);
 
     loop {
         match framing::read_frame(&mut reader, &mut buffer) {
             Ok(_) if stop.is_stopped() => break,
-            Ok(true) => handle_frame(&buffer, labels),
+            Ok(true) => state.handle_frame(&buffer),
             Ok(false) => break,
             Err(e) => {
                 log_connection_error(&e);
+                state.stream_error();
                 break;
             }
         }
@@ -253,7 +267,7 @@ fn read_connection(stream: Stream, labels: &ExtraLabels, stop: &StopSignal) {
 }
 
 #[cfg(feature = "tokio")]
-async fn run_collector(listener: Listener, labels: ExtraLabels, mut stop: StopSignal) {
+async fn run_collector(listener: Listener, options: CollectorOptions, mut stop: StopSignal) {
     let mut connections = task::JoinSet::new();
 
     loop {
@@ -262,7 +276,7 @@ async fn run_collector(listener: Listener, labels: ExtraLabels, mut stop: StopSi
             () = stop.stopped() => break,
             conn = listener.accept() => match conn {
                 Ok(stream) => {
-                    connections.spawn(read_connection(stream, labels.clone(), stop.clone()));
+                    connections.spawn(read_connection(stream, options.clone(), stop.clone()));
                 }
                 Err(e) => log::debug!("Failed to accept metrics connection: {e}"),
             },
@@ -275,19 +289,25 @@ async fn run_collector(listener: Listener, labels: ExtraLabels, mut stop: StopSi
 }
 
 #[cfg(feature = "tokio")]
-async fn read_connection(stream: LocalSocketStream, labels: ExtraLabels, mut stop: StopSignal) {
+async fn read_connection(
+    stream: LocalSocketStream,
+    options: CollectorOptions,
+    mut stop: StopSignal,
+) {
     let mut reader = BufReader::new(stream);
     let mut buffer: Vec<u8> = Vec::new();
+    let mut state = StreamState::new(options);
 
     loop {
         tokio::select! {
             biased;
             () = stop.stopped() => break,
             result = framing::read_frame_async(&mut reader, &mut buffer) => match result {
-                Ok(true) => handle_frame(&buffer, &labels),
+                Ok(true) => state.handle_frame(&buffer),
                 Ok(false) => break,
                 Err(e) => {
                     log_connection_error(&e);
+                    state.stream_error();
                     break;
                 }
             },

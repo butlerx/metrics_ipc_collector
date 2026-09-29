@@ -1,6 +1,6 @@
 use super::{
     handle::{CollectorHandle, StopSignal},
-    handlers::{ExtraLabels, handle_frame},
+    handlers::{CollectorOptions, StreamState},
 };
 use crate::{error::MetricsError, framing};
 use interprocess::unnamed_pipe::pipe;
@@ -32,6 +32,7 @@ type OwnedPipeHandle = std::os::windows::io::OwnedHandle;
 pub struct IPCPipeCollector {
     receiver: PipeReceiver,
     labels: Vec<(String, String)>,
+    internal_metrics: bool,
 }
 
 impl IPCPipeCollector {
@@ -74,6 +75,7 @@ impl IPCPipeCollector {
         Self {
             receiver,
             labels: Vec::new(),
+            internal_metrics: false,
         }
     }
 
@@ -100,6 +102,17 @@ impl IPCPipeCollector {
         })
     }
 
+    /// Also records the collector's own metrics, labelled with the collector
+    /// labels: `metrics_ipc_collector_events_total`,
+    /// `metrics_ipc_collector_decode_errors_total`,
+    /// `metrics_ipc_collector_stream_errors_total` and the
+    /// `metrics_ipc_collector_connections` gauge. Off by default.
+    #[must_use]
+    pub const fn internal_metrics(mut self, enabled: bool) -> Self {
+        self.internal_metrics = enabled;
+        self
+    }
+
     /// Starts collecting metrics from the unnamed pipe on a background thread,
     /// or a Tokio task when the `tokio` feature is enabled.
     ///
@@ -111,10 +124,10 @@ impl IPCPipeCollector {
     /// feature enabled, this also returns an error when called outside a Tokio
     /// runtime.
     pub fn start_collecting(self) -> Result<CollectorHandle, MetricsError> {
-        let labels: ExtraLabels = self.labels.into();
+        let options = CollectorOptions::new(self.labels, self.internal_metrics);
 
         #[cfg(not(feature = "tokio"))]
-        return CollectorHandle::spawn(move |stop| run_collector(self.receiver, &labels, &stop))
+        return CollectorHandle::spawn(move |stop| run_collector(self.receiver, options, &stop))
             .map_err(Into::into);
 
         #[cfg(feature = "tokio")]
@@ -128,27 +141,29 @@ impl IPCPipeCollector {
                 ))?
             };
             Ok(CollectorHandle::spawn(&runtime, move |stop| {
-                run_collector(receiver, labels, stop)
+                run_collector(receiver, options, stop)
             }))
         }
     }
 }
 
 #[cfg(not(feature = "tokio"))]
-fn run_collector(receiver: PipeReceiver, labels: &ExtraLabels, stop: &StopSignal) {
+fn run_collector(receiver: PipeReceiver, options: CollectorOptions, stop: &StopSignal) {
     let mut reader = std::io::BufReader::new(receiver);
     let mut buffer: Vec<u8> = Vec::new();
+    let mut state = StreamState::new(options);
 
     loop {
         match framing::read_frame(&mut reader, &mut buffer) {
             Ok(_) if stop.is_stopped() => break,
-            Ok(true) => handle_frame(&buffer, labels),
+            Ok(true) => state.handle_frame(&buffer),
             Ok(false) => {
                 log::info!("Metrics sender closed, stopping collector");
                 break;
             }
             Err(e) => {
                 log::error!("Error reading from pipe: {e}");
+                state.stream_error();
                 break;
             }
         }
@@ -158,24 +173,26 @@ fn run_collector(receiver: PipeReceiver, labels: &ExtraLabels, stop: &StopSignal
 #[cfg(feature = "tokio")]
 async fn run_collector(
     receiver: interprocess::unnamed_pipe::tokio::Recver,
-    labels: ExtraLabels,
+    options: CollectorOptions,
     mut stop: StopSignal,
 ) {
     let mut reader = tokio::io::BufReader::new(receiver);
     let mut buffer: Vec<u8> = Vec::new();
+    let mut state = StreamState::new(options);
 
     loop {
         tokio::select! {
             biased;
             () = stop.stopped() => break,
             result = framing::read_frame_async(&mut reader, &mut buffer) => match result {
-                Ok(true) => handle_frame(&buffer, &labels),
+                Ok(true) => state.handle_frame(&buffer),
                 Ok(false) => {
                     log::info!("Metrics sender closed, stopping collector");
                     break;
                 }
                 Err(e) => {
                     log::error!("Error reading from pipe: {e}");
+                    state.stream_error();
                     break;
                 }
             },

@@ -56,6 +56,14 @@ pub enum MetricOperation {
     RecordHistogramBatch(Vec<f64>),
 }
 
+/// Sent by a recorder at the start of each connection to identify itself.
+///
+/// The collector adds these labels to every metric on that connection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Hello {
+    pub labels: BTreeMap<String, String>,
+}
+
 /// An event sent over IPC, representing either metric metadata or metric data.
 ///
 /// Used for communication between processes and the collector.
@@ -67,6 +75,8 @@ pub enum MetricEvent {
     Metadata(MetricMetadata),
     /// Data for a single metric event (name, labels, operation).
     Metric(MetricData),
+    /// Labels identifying the sender, sent once per connection.
+    Hello(Hello),
 }
 
 impl TryFrom<&[u8]> for MetricEvent {

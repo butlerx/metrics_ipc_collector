@@ -8,18 +8,15 @@
 //! In batching mode updates only touch in-process cells, which a flusher
 //! drains on an interval and once more when the recorder is dropped.
 
+use super::transport::Transport;
 use crate::{
-    events::{MetricData, MetricEvent, MetricKind, MetricMetadata, MetricOperation},
+    events::{Hello, MetricData, MetricEvent, MetricKind, MetricMetadata, MetricOperation},
     framing,
 };
 use std::{
     collections::{BTreeMap, HashMap},
-    io::Write,
     mem,
-    sync::{
-        Arc, Mutex, PoisonError, RwLock,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex, PoisonError, RwLock},
     time::Duration,
 };
 
@@ -27,13 +24,53 @@ use std::{
 #[cfg(feature = "tokio")]
 pub const DEFAULT_QUEUE_CAPACITY: usize = 8192;
 
+/// Name of the counter of events the recorder could not deliver.
+pub const DROPPED_EVENTS_METRIC: &str = "metrics_ipc_recorder_dropped_events_total";
+/// Name of the counter of transport reconnections.
+pub const RECONNECTS_METRIC: &str = "metrics_ipc_recorder_reconnects_total";
+
 /// Options shared by every recorder builder.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct RecorderConfig {
     #[cfg(feature = "tokio")]
     pub queue_capacity: Option<usize>,
     pub flush_interval: Option<Duration>,
+    /// Labels sent once per connection in a hello frame.
+    pub labels: BTreeMap<String, String>,
+    /// Report the recorder's own counters alongside the application's metrics.
+    pub internal_metrics: bool,
 }
+
+impl RecorderConfig {
+    /// Adds or replaces a hello label.
+    pub fn set_label(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.labels.insert(key.into(), value.into());
+    }
+
+    /// Encodes the hello frame, if there are labels to send.
+    pub fn hello_frame(&self) -> Option<Vec<u8>> {
+        if self.labels.is_empty() {
+            return None;
+        }
+        let hello = MetricEvent::Hello(Hello {
+            labels: self.labels.clone(),
+        });
+        framing::encode(&hello)
+            .inspect_err(|e| log::error!("Failed to encode hello frame: {e}"))
+            .ok()
+    }
+}
+
+fn counter_event(name: &str, value: u64) -> MetricEvent {
+    MetricEvent::Metric(MetricData {
+        name: name.to_string(),
+        labels: BTreeMap::new(),
+        operation: MetricOperation::SetCounter(value),
+    })
+}
+
+#[cfg(feature = "tokio")]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Bounded queue from metric handles to the Tokio writer task.
 ///
@@ -63,10 +100,21 @@ impl EventQueue {
     }
 }
 
+/// Mutable state of a blocking recorder, guarded by one lock.
+struct InlineState {
+    transport: Box<dyn Transport>,
+    /// Events that could not be written.
+    dropped: u64,
+    /// `(dropped, reconnects)` as last reported to the collector.
+    reported: (u64, u64),
+    /// Whether the last write failed, so failures are logged once per outage.
+    failing: bool,
+}
+
 /// A blocking transport shared by every handle, written under a lock.
 struct InlineWriter {
-    writer: Mutex<Box<dyn Write + Send>>,
-    failures: AtomicU64,
+    state: Mutex<InlineState>,
+    internal_metrics: bool,
 }
 
 impl std::fmt::Debug for InlineWriter {
@@ -78,17 +126,41 @@ impl std::fmt::Debug for InlineWriter {
 impl InlineWriter {
     fn write_events(&self, events: impl IntoIterator<Item = MetricEvent>) {
         let mut out = Vec::new();
+        let mut count = 0;
         for event in events {
-            encode_into(&event, &mut out);
+            if encode_into(&event, &mut out) {
+                count += 1;
+            }
         }
         if out.is_empty() {
             return;
         }
-        let result = framing::write_all_blocking(&mut *lock(&self.writer), &out);
-        if let Err(e) = result
-            && self.failures.fetch_add(1, Ordering::Relaxed) == 0
-        {
-            log::error!("Failed to write metric events: {e}");
+
+        let mut state = lock(&self.state);
+        let snapshot = (state.dropped, state.transport.reconnects());
+        let report = self.internal_metrics && snapshot != state.reported;
+        if report {
+            encode_into(&counter_event(DROPPED_EVENTS_METRIC, snapshot.0), &mut out);
+            encode_into(&counter_event(RECONNECTS_METRIC, snapshot.1), &mut out);
+        }
+
+        match state.transport.send(&out) {
+            Ok(()) => {
+                if state.failing {
+                    log::info!("Metric events are being delivered again");
+                    state.failing = false;
+                }
+                if report {
+                    state.reported = snapshot;
+                }
+            }
+            Err(e) => {
+                state.dropped += count;
+                if !state.failing {
+                    log::warn!("Failed to write metric events, dropping them: {e}");
+                    state.failing = true;
+                }
+            }
         }
     }
 }
@@ -473,17 +545,24 @@ macro_rules! delegate_recorder {
 }
 pub(crate) use delegate_recorder;
 
-fn batch_for(config: RecorderConfig) -> Option<Arc<BatchRegistry>> {
+fn batch_for(config: &RecorderConfig) -> Option<Arc<BatchRegistry>> {
     config
         .flush_interval
         .map(|_| Arc::new(BatchRegistry::default()))
 }
 
-/// Encodes and buffers an event, logging and skipping ones that cannot be encoded.
-fn encode_into(event: &MetricEvent, out: &mut Vec<u8>) {
+/// Encodes and buffers an event, logging and skipping ones that cannot be
+/// encoded. Returns whether the event was buffered.
+fn encode_into(event: &MetricEvent, out: &mut Vec<u8>) -> bool {
     match framing::encode(event) {
-        Ok(frame) => out.extend_from_slice(&frame),
-        Err(e) => log::error!("Failed to encode metric event: {e}"),
+        Ok(frame) => {
+            out.extend_from_slice(&frame);
+            true
+        }
+        Err(e) => {
+            log::error!("Failed to encode metric event: {e}");
+            false
+        }
     }
 }
 
@@ -493,12 +572,20 @@ fn encode_into(event: &MetricEvent, out: &mut Vec<u8>) {
 /// a flusher thread writes the batch every interval, and once more when the
 /// last recorder clone is dropped.
 ///
-pub fn sync_core<W: Write + Send + 'static>(writer: W, config: RecorderConfig) -> Core {
+pub fn sync_core(mut transport: Box<dyn Transport>, config: &RecorderConfig) -> Core {
+    if let Err(e) = transport.start(config.hello_frame()) {
+        log::warn!("Failed to send metrics hello frame: {e}");
+    }
     let batch = batch_for(config);
     let shared = Arc::new(SyncShared {
         writer: InlineWriter {
-            writer: Mutex::new(Box::new(writer)),
-            failures: AtomicU64::new(0),
+            state: Mutex::new(InlineState {
+                transport,
+                dropped: 0,
+                reported: (0, 0),
+                failing: false,
+            }),
+            internal_metrics: config.internal_metrics,
         },
         batch: batch.clone(),
     });
@@ -536,75 +623,103 @@ where
 {
     let (sender, receiver) =
         tokio::sync::mpsc::channel(config.queue_capacity.unwrap_or(DEFAULT_QUEUE_CAPACITY));
-    let batch = batch_for(config);
-    let writer_batch = batch.clone();
+    let batch = batch_for(&config);
+    let queue = EventQueue::new(sender);
+    let task = TaskWriter {
+        receiver,
+        batch: batch.clone(),
+        dropped: config.internal_metrics.then(|| queue.dropped.clone()),
+        config,
+    };
 
     runtime.spawn(async move {
-        if let Err(e) = run_task_writer(writer, receiver, writer_batch, config).await {
+        if let Err(e) = task.run(writer).await {
             log::error!("Failed to write metric events: {e}");
         }
     });
 
     Core {
-        sink: Sink::Queue(EventQueue::new(sender)),
+        sink: Sink::Queue(queue),
         batch,
     }
 }
 
+/// State of the Tokio writer task.
 #[cfg(feature = "tokio")]
-async fn run_task_writer<W>(
-    mut writer: W,
-    mut receiver: tokio::sync::mpsc::Receiver<MetricEvent>,
+struct TaskWriter {
+    receiver: tokio::sync::mpsc::Receiver<MetricEvent>,
     batch: Option<Arc<BatchRegistry>>,
+    /// The queue's drop counter, when internal metrics are enabled.
+    dropped: Option<Arc<AtomicU64>>,
     config: RecorderConfig,
-) -> std::io::Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    use tokio::io::AsyncWriteExt;
+}
 
-    let mut ticker = config.flush_interval.map(|interval| {
-        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        ticker
-    });
-    let mut out = Vec::new();
+#[cfg(feature = "tokio")]
+impl TaskWriter {
+    async fn run<W>(mut self, mut writer: W) -> std::io::Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::AsyncWriteExt;
 
-    loop {
-        out.clear();
-        let closed = tokio::select! {
-            event = receiver.recv() => {
-                let closed = event.is_none();
-                if let Some(event) = event {
-                    encode_into(&event, &mut out);
-                    // Write whatever else is already waiting in one go.
-                    while let Ok(event) = receiver.try_recv() {
+        if let Some(hello) = self.config.hello_frame() {
+            writer.write_all(&hello).await?;
+        }
+
+        let mut ticker = self.config.flush_interval.map(|interval| {
+            let mut ticker =
+                tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker
+        });
+        let mut out = Vec::new();
+        let mut reported_dropped = 0;
+
+        loop {
+            out.clear();
+            let closed = tokio::select! {
+                event = self.receiver.recv() => {
+                    let closed = event.is_none();
+                    if let Some(event) = event {
                         encode_into(&event, &mut out);
+                        // Write whatever else is already waiting in one go.
+                        while let Ok(event) = self.receiver.try_recv() {
+                            encode_into(&event, &mut out);
+                        }
                     }
+                    closed
+                },
+                () = tick(ticker.as_mut()) => {
+                    self.drain_batch(&mut out);
+                    false
                 }
-                closed
-            },
-            () = tick(ticker.as_mut()) => {
-                if let Some(batch) = &batch {
-                    for event in batch.drain() {
-                        encode_into(&event, &mut out);
-                    }
-                }
-                false
+            };
+
+            if closed {
+                self.drain_batch(&mut out);
             }
-        };
+            if let Some(dropped) = &self.dropped {
+                let dropped = dropped.load(Ordering::Relaxed);
+                if dropped != reported_dropped {
+                    encode_into(&counter_event(DROPPED_EVENTS_METRIC, dropped), &mut out);
+                    reported_dropped = dropped;
+                }
+            }
+            if !out.is_empty() {
+                // No flush: nothing is buffered, see `framing::write_all_blocking`.
+                writer.write_all(&out).await?;
+            }
+            if closed {
+                return Ok(());
+            }
+        }
+    }
 
-        if closed && let Some(batch) = &batch {
+    fn drain_batch(&self, out: &mut Vec<u8>) {
+        if let Some(batch) = &self.batch {
             for event in batch.drain() {
-                encode_into(&event, &mut out);
+                encode_into(&event, out);
             }
-        }
-        if !out.is_empty() {
-            // No flush: nothing is buffered, see `framing::write_all_blocking`.
-            writer.write_all(&out).await?;
-        }
-        if closed {
-            return Ok(());
         }
     }
 }
