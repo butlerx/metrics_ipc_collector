@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.5.0](https://github.com/butlerx/metrics_ipc_collector/compare/v0.4.1...v0.5.0) (2026-09-29)
+
+
+### ⚠ BREAKING CHANGES
+
+* frames now carry a magic and version header. The deprecated `IPCCollector`, `IPCRecorder` and `IPCRecorderBuilder` aliases were removed. `interprocess` 2.4 or later is required.
+* the wire format changed, so 0.5 senders and collectors cannot talk to 0.4. `start_collecting` returns `CollectorHandle` instead of `()`. `PipeSender` is now the blocking pipe type under the `tokio` feature too. `MetricsError::PipeCollectorConsumed` was removed and `FrameTooLarge` / `CollectorPanicked` were added.
+
+### Features
+
+* harden IPC framing and extend collector and recorder APIs ([fdb5dc2](https://github.com/butlerx/metrics_ipc_collector/commit/fdb5dc2b57ec47421cca297f2e25abd23db99a63))
+* reconnect, sender labels, handle caching and internal metrics ([686f84b](https://github.com/butlerx/metrics_ipc_collector/commit/686f84b07c9ad5f880a8e3823614a28931e6b468))
+* version the wire format and make socket addresses explicit ([9cfecb5](https://github.com/butlerx/metrics_ipc_collector/commit/9cfecb5a8fa9d6cc1771174ae55d3183ff2108e3))
+
+
+### Bug Fixes
+
+* separate recorder counters per process and stop sockets promptly ([017a6c3](https://github.com/butlerx/metrics_ipc_collector/commit/017a6c3e09296ad48ff8922b87b4bfb435fcac29))
+
 ## [0.4.1](https://github.com/butlerx/metrics_ipc_collector/compare/v0.4.0...v0.4.1) (2026-09-27)
 
 
