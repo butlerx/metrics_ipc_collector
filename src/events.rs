@@ -56,12 +56,22 @@ pub enum MetricOperation {
     RecordHistogramBatch(Vec<f64>),
 }
 
+/// A named sender and its generation. When several senders claim the same
+/// source, only the one with the highest generation may set its gauges.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Source {
+    pub name: String,
+    pub generation: u64,
+}
+
 /// Sent by a recorder at the start of each connection to identify itself.
 ///
 /// The collector adds these labels to every metric on that connection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Hello {
     pub labels: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Source>,
 }
 
 /// An event sent over IPC, representing either metric metadata or metric data.

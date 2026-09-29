@@ -10,13 +10,16 @@
 
 use super::transport::Transport;
 use crate::{
-    events::{Hello, MetricData, MetricEvent, MetricKind, MetricMetadata, MetricOperation},
+    events::{Hello, MetricData, MetricEvent, MetricKind, MetricMetadata, MetricOperation, Source},
     framing,
 };
 use std::{
     collections::{BTreeMap, HashMap},
     mem,
-    sync::{Arc, Mutex, PoisonError, RwLock},
+    sync::{
+        Arc, Mutex, PoisonError, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -37,6 +40,8 @@ pub struct RecorderConfig {
     pub flush_interval: Option<Duration>,
     /// Labels sent once per connection in a hello frame.
     pub labels: BTreeMap<String, String>,
+    /// Source and generation sent in the hello frame.
+    pub source: Option<Source>,
     /// Report the recorder's own counters alongside the application's metrics.
     pub internal_metrics: bool,
 }
@@ -47,13 +52,14 @@ impl RecorderConfig {
         self.labels.insert(key.into(), value.into());
     }
 
-    /// Encodes the hello frame, if there are labels to send.
+    /// Encodes the hello frame, if there are labels or a source to send.
     pub fn hello_frame(&self) -> Option<Vec<u8>> {
-        if self.labels.is_empty() {
+        if self.labels.is_empty() && self.source.is_none() {
             return None;
         }
         let hello = MetricEvent::Hello(Hello {
             labels: self.labels.clone(),
+            source: self.source.clone(),
         });
         framing::encode(&hello)
             .inspect_err(|e| log::error!("Failed to encode hello frame: {e}"))
@@ -63,7 +69,7 @@ impl RecorderConfig {
 
 /// One of the recorder's own counters.
 ///
-/// Labelled with the process id: every recorder sends absolute values, so two
+/// Labelled with the process id: these are sent as absolute values, so two
 /// recorders sharing a series would overwrite each other's counts.
 fn counter_event(name: &str, value: u64) -> MetricEvent {
     MetricEvent::Metric(MetricData {
@@ -72,9 +78,6 @@ fn counter_event(name: &str, value: u64) -> MetricEvent {
         operation: MetricOperation::SetCounter(value),
     })
 }
-
-#[cfg(feature = "tokio")]
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Bounded queue from metric handles to the Tokio writer task.
 ///
@@ -224,6 +227,9 @@ fn metric_data(key: &metrics::Key, operation: MetricOperation) -> MetricData {
 struct ImmediateHandle {
     key: metrics::Key,
     sink: Sink,
+    /// The counter's local value, shared by every handle for the same key.
+    /// Only set for counters.
+    total: Option<Arc<AtomicU64>>,
 }
 
 impl ImmediateHandle {
@@ -233,13 +239,26 @@ impl ImmediateHandle {
     }
 }
 
+// Counters are always sent as increments. `absolute` follows the `metrics`
+// meaning ("at least this value"), applied to the local total, and sends the
+// difference. Collectors then only ever add, so counters from a restarted or
+// overlapping sender accumulate instead of being stuck at the old maximum.
 impl metrics::CounterFn for ImmediateHandle {
     fn increment(&self, value: u64) {
+        if let Some(total) = &self.total {
+            total.fetch_add(value, Ordering::Relaxed);
+        }
         self.push(MetricOperation::IncrementCounter(value));
     }
 
     fn absolute(&self, value: u64) {
-        self.push(MetricOperation::SetCounter(value));
+        let previous = self
+            .total
+            .as_ref()
+            .map_or(0, |total| total.fetch_max(value, Ordering::Relaxed));
+        if value > previous {
+            self.push(MetricOperation::IncrementCounter(value - previous));
+        }
     }
 }
 
@@ -269,34 +288,37 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[derive(Debug, Default)]
 struct CounterState {
-    absolute: Option<u64>,
-    delta: u64,
+    /// The counter's local value.
+    total: u64,
+    /// How much of `total` has been flushed.
+    sent: u64,
 }
 
-/// Counter updates accumulated between flushes.
+/// Counter updates accumulated between flushes, sent as one increment.
 #[derive(Debug, Default)]
 struct CounterCell(Mutex<CounterState>);
 
 impl CounterCell {
-    fn take(&self) -> impl Iterator<Item = MetricOperation> {
-        let state = mem::take(&mut *lock(&self.0));
-        let absolute = state.absolute.map(MetricOperation::SetCounter);
-        let delta = (state.delta > 0).then_some(MetricOperation::IncrementCounter(state.delta));
-        absolute.into_iter().chain(delta)
+    fn take(&self) -> Option<MetricOperation> {
+        let delta = {
+            let mut state = lock(&self.0);
+            let delta = state.total - state.sent;
+            state.sent = state.total;
+            delta
+        };
+        (delta > 0).then_some(MetricOperation::IncrementCounter(delta))
     }
 }
 
 impl metrics::CounterFn for CounterCell {
     fn increment(&self, value: u64) {
         let mut state = lock(&self.0);
-        state.delta = state.delta.saturating_add(value);
+        state.total = state.total.saturating_add(value);
     }
 
     fn absolute(&self, value: u64) {
-        *lock(&self.0) = CounterState {
-            absolute: Some(value),
-            delta: 0,
-        };
+        let mut state = lock(&self.0);
+        state.total = state.total.max(value);
     }
 }
 
@@ -407,7 +429,11 @@ struct BatchRegistry {
 impl BatchRegistry {
     fn drain(&self) -> Vec<MetricEvent> {
         let mut events = Vec::new();
-        drain(&self.counters, |c| c.take().collect(), &mut events);
+        drain(
+            &self.counters,
+            |c| c.take().into_iter().collect(),
+            &mut events,
+        );
         drain(
             &self.gauges,
             |g| g.take().into_iter().collect(),
@@ -428,6 +454,8 @@ impl BatchRegistry {
 pub struct Core {
     sink: Sink,
     batch: Option<Arc<BatchRegistry>>,
+    /// Local counter values for immediate mode, keyed by metric.
+    counter_totals: Arc<CellMap<AtomicU64>>,
 }
 
 impl Core {
@@ -450,6 +478,7 @@ impl Core {
         Arc::new(ImmediateHandle {
             key: key.clone(),
             sink: self.sink.clone(),
+            total: None,
         })
     }
 
@@ -457,7 +486,11 @@ impl Core {
         if let Some(batch) = &self.batch {
             return metrics::Counter::from_arc(cell(&batch.counters, key));
         }
-        metrics::Counter::from_arc(self.immediate(key))
+        metrics::Counter::from_arc(Arc::new(ImmediateHandle {
+            key: key.clone(),
+            sink: self.sink.clone(),
+            total: Some(cell(&self.counter_totals, key)),
+        }))
     }
 
     pub fn gauge(&self, key: &metrics::Key) -> metrics::Gauge {
@@ -612,6 +645,7 @@ pub fn sync_core(mut transport: Box<dyn Transport>, config: &RecorderConfig) -> 
     Core {
         sink: Sink::Inline(shared),
         batch,
+        counter_totals: Arc::default(),
     }
 }
 
@@ -645,6 +679,7 @@ where
     Core {
         sink: Sink::Queue(queue),
         batch,
+        counter_totals: Arc::default(),
     }
 }
 
@@ -744,22 +779,77 @@ mod tests {
     use metrics::{CounterFn, GaugeFn, HistogramFn};
 
     #[test]
-    fn counter_cell_sends_absolute_then_later_increments() {
+    fn counter_cell_sends_the_local_change_as_one_increment() {
         let cell = CounterCell::default();
         cell.increment(5);
         cell.absolute(100);
         cell.increment(2);
         cell.increment(3);
-
-        let ops: Vec<_> = cell.take().collect();
+        // Same as a local counter: max(5, 100) + 2 + 3.
         assert!(matches!(
-            ops.as_slice(),
-            [
-                MetricOperation::SetCounter(100),
-                MetricOperation::IncrementCounter(5)
-            ]
+            cell.take(),
+            Some(MetricOperation::IncrementCounter(105))
         ));
-        assert_eq!(cell.take().count(), 0, "cell should reset after a flush");
+        assert!(cell.take().is_none(), "nothing changed since the flush");
+
+        cell.absolute(50);
+        assert!(cell.take().is_none(), "absolute never lowers a counter");
+        cell.absolute(110);
+        assert!(matches!(
+            cell.take(),
+            Some(MetricOperation::IncrementCounter(5))
+        ));
+    }
+
+    /// A transport that keeps everything written to it.
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Transport for Capture {
+        fn start(&mut self, hello: Option<Vec<u8>>) -> std::io::Result<()> {
+            hello.map_or(Ok(()), |hello| self.send(&hello))
+        }
+
+        fn send(&mut self, frames: &[u8]) -> std::io::Result<()> {
+            lock(&self.0).extend_from_slice(frames);
+            Ok(())
+        }
+    }
+
+    fn captured_operations(bytes: &[u8]) -> Vec<MetricOperation> {
+        let mut reader = std::io::Cursor::new(bytes);
+        let mut buffer = Vec::new();
+        let mut ops = Vec::new();
+        while framing::read_frame(&mut reader, &mut buffer).unwrap() {
+            if let Ok(MetricEvent::Metric(metric)) = MetricEvent::try_from(buffer.as_slice()) {
+                ops.push(metric.operation);
+            }
+        }
+        ops
+    }
+
+    #[test]
+    fn immediate_absolute_sends_the_difference() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let core = sync_core(Box::new(Capture(bytes.clone())), &RecorderConfig::default());
+        let key = metrics::Key::from_name("requests");
+        core.counter(&key).absolute(10);
+        // A fresh handle for the same key shares the total.
+        core.counter(&key).absolute(4);
+        core.counter(&key).increment(1);
+        core.counter(&key).absolute(15);
+
+        let ops = captured_operations(&lock(&bytes));
+        assert!(
+            matches!(
+                ops.as_slice(),
+                [
+                    MetricOperation::IncrementCounter(10),
+                    MetricOperation::IncrementCounter(1),
+                    MetricOperation::IncrementCounter(4),
+                ]
+            ),
+            "{ops:?}"
+        );
     }
 
     #[test]
@@ -820,6 +910,7 @@ mod tests {
         let handle = ImmediateHandle {
             key: metrics::Key::from_name("requests"),
             sink: Sink::Queue(queue.clone()),
+            total: None,
         };
 
         for _ in 0..3 {

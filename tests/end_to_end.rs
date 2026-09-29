@@ -79,6 +79,21 @@ const BATCHED_LINES: &[&str] = &[
     r#"e2e_batched_latency_sum{host="h",worker="2"} 6"#,
 ];
 
+/// Runs `f` with a Tokio runtime entered when the `tokio` feature is on.
+fn with_runtime<T>(f: impl FnOnce() -> T) -> T {
+    #[cfg(feature = "tokio")]
+    {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        f()
+    }
+    #[cfg(not(feature = "tokio"))]
+    f()
+}
+
 #[cfg(unix)]
 type PipeHandle = std::os::fd::OwnedFd;
 #[cfg(windows)]
@@ -300,21 +315,6 @@ mod socket_addresses {
     use super::*;
     use std::path::PathBuf;
 
-    /// Runs `f` with a Tokio runtime entered when the `tokio` feature is on.
-    fn with_runtime<T>(f: impl FnOnce() -> T) -> T {
-        #[cfg(feature = "tokio")]
-        {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let _guard = runtime.enter();
-            f()
-        }
-        #[cfg(not(feature = "tokio"))]
-        f()
-    }
-
     fn temp_socket(name: &str) -> PathBuf {
         let mode = if cfg!(feature = "tokio") {
             "tokio"
@@ -468,6 +468,82 @@ mod socket_addresses {
                 std::process::id()
             );
             wait_for(&[&reconnects, r#"e2e_reconnect_total{generation="2"} 2"#]);
+        });
+    }
+}
+
+/// A worker slot whose sender is replaced, as when a server respawns a
+/// worker: one pipe per process, arbitrated by source generation.
+mod sources {
+    use super::*;
+
+    fn slot_collector(generation: u64) -> (metrics_ipc_collector::CollectorHandle, PipeSender) {
+        let (collector, sender) = IPCPipeCollector::new().unwrap();
+        let handle = collector
+            .with_label("worker", "slot")
+            .source("e2e-slot", generation)
+            .start_collecting()
+            .unwrap();
+        (handle, sender)
+    }
+
+    fn join(handle: metrics_ipc_collector::CollectorHandle) {
+        #[cfg(feature = "tokio")]
+        tokio::runtime::Handle::current()
+            .block_on(handle.join())
+            .unwrap();
+        #[cfg(not(feature = "tokio"))]
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn replaced_sender_hands_over_cleanly() {
+        prometheus();
+        with_runtime(|| {
+            let (old_collector, old_sender) = slot_collector(1);
+            let old = IPCPipeRecorder::builder(old_sender)
+                .build_recorder()
+                .unwrap();
+            metrics::with_local_recorder(&old, || {
+                metrics::counter!("e2e_slot_served_total").absolute(100);
+                metrics::gauge!("e2e_slot_inflight").set(5.0);
+            });
+            wait_for(&[
+                r#"e2e_slot_served_total{worker="slot"} 100"#,
+                r#"e2e_slot_inflight{worker="slot"} 5"#,
+            ]);
+
+            // The replacement starts counting from zero on its own pipe.
+            let (new_collector, new_sender) = slot_collector(2);
+            let new = IPCPipeRecorder::builder(new_sender)
+                .build_recorder()
+                .unwrap();
+            metrics::with_local_recorder(&new, || {
+                metrics::counter!("e2e_slot_served_total").absolute(3);
+                metrics::gauge!("e2e_slot_inflight").set(7.0);
+            });
+            wait_for(&[
+                r#"e2e_slot_served_total{worker="slot"} 103"#,
+                r#"e2e_slot_inflight{worker="slot"} 7"#,
+            ]);
+
+            // The old worker drains: its work counts, its gauges do not.
+            metrics::with_local_recorder(&old, || {
+                metrics::counter!("e2e_slot_served_total").absolute(101);
+                metrics::gauge!("e2e_slot_inflight").set(9.0);
+            });
+            wait_for(&[r#"e2e_slot_served_total{worker="slot"} 104"#]);
+            drop(old);
+            join(old_collector);
+            wait_for(&[r#"e2e_slot_inflight{worker="slot"} 7"#]);
+
+            // The newest worker exits: its gauges are cleared.
+            drop(new);
+            join(new_collector);
+            wait_for(&[
+                r#"e2e_slot_inflight{worker="slot"} 0"#,
+                r#"e2e_slot_served_total{worker="slot"} 104"#,
+            ]);
         });
     }
 }

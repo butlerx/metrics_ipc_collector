@@ -1,7 +1,12 @@
-use crate::events::{MetricData, MetricEvent, MetricKind, MetricMetadata, MetricOperation};
+use crate::events::{
+    Hello, MetricData, MetricEvent, MetricKind, MetricMetadata, MetricOperation, Source,
+};
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::Arc,
+    sync::{
+        Arc, LazyLock, Mutex, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 /// Labels a collector adds to every metric it receives.
@@ -19,6 +24,10 @@ type SeriesKey = (String, BTreeMap<String, String>);
 pub struct CollectorOptions {
     pub labels: ExtraLabels,
     pub internal_metrics: bool,
+    /// Source set by the collector, which takes precedence over the sender's.
+    pub source: Option<Source>,
+    /// Zero the source's gauges when its newest sender goes away.
+    pub clear_gauges_on_end: bool,
 }
 
 impl CollectorOptions {
@@ -26,7 +35,48 @@ impl CollectorOptions {
         Self {
             labels: labels.into(),
             internal_metrics,
+            source: None,
+            clear_gauges_on_end: false,
         }
+    }
+}
+
+/// Newest generation claimed for each source name, shared by every collector
+/// in the process.
+static SOURCES: LazyLock<Mutex<HashMap<String, Arc<AtomicU64>>>> = LazyLock::new(Mutex::default);
+
+/// A stream's claim on a source.
+struct Claim {
+    name: String,
+    generation: u64,
+    newest: Arc<AtomicU64>,
+}
+
+impl Claim {
+    fn new(source: Source) -> Self {
+        let newest = SOURCES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(source.name.clone())
+            .or_default()
+            .clone();
+        let previous = newest.fetch_max(source.generation, Ordering::AcqRel);
+        if previous > source.generation {
+            log::info!(
+                "Sender for source {:?} has generation {} but {previous} is newer; ignoring its gauges",
+                source.name,
+                source.generation
+            );
+        }
+        Self {
+            name: source.name,
+            generation: source.generation,
+            newest,
+        }
+    }
+
+    fn is_newest(&self) -> bool {
+        self.newest.load(Ordering::Acquire) <= self.generation
     }
 }
 
@@ -63,6 +113,7 @@ impl Drop for InternalMetrics {
 pub struct StreamState {
     options: CollectorOptions,
     hello: BTreeMap<String, String>,
+    claim: Option<Claim>,
     counters: HashMap<SeriesKey, metrics::Counter>,
     gauges: HashMap<SeriesKey, metrics::Gauge>,
     histograms: HashMap<SeriesKey, metrics::Histogram>,
@@ -75,9 +126,11 @@ impl StreamState {
         let internal = options
             .internal_metrics
             .then(|| InternalMetrics::new(&options.labels));
+        let claim = options.source.clone().map(Claim::new);
         Self {
             options,
             hello: BTreeMap::new(),
+            claim,
             counters: HashMap::new(),
             gauges: HashMap::new(),
             histograms: HashMap::new(),
@@ -95,7 +148,7 @@ impl StreamState {
                 match event {
                     MetricEvent::Metadata(metadata) => handle_metadata_event(metadata),
                     MetricEvent::Metric(metric) => self.handle_metric(metric),
-                    MetricEvent::Hello(hello) => self.set_hello(hello.labels),
+                    MetricEvent::Hello(hello) => self.set_hello(hello),
                 }
             }
             Err(e) => {
@@ -119,8 +172,34 @@ impl StreamState {
         }
     }
 
-    fn set_hello(&mut self, labels: BTreeMap<String, String>) {
-        self.hello = labels;
+    /// Called when the sender closed the stream or it failed. If this stream
+    /// is its source's newest sender and the collector asked for it, the
+    /// gauges it set are zeroed so a departed sender does not linger.
+    pub fn end_of_stream(&self) {
+        let newest = self.claim.as_ref().is_some_and(Claim::is_newest);
+        if self.options.clear_gauges_on_end && newest {
+            if let Some(claim) = &self.claim {
+                log::debug!("Clearing gauges for source {:?}", claim.name);
+            }
+            for gauge in self.gauges.values() {
+                gauge.set(0.0);
+            }
+        }
+    }
+
+    /// Whether this stream may set gauges: streams without a source always
+    /// may, and claimed ones only while they are the newest generation.
+    fn may_set_gauges(&self) -> bool {
+        self.claim.as_ref().is_none_or(Claim::is_newest)
+    }
+
+    fn set_hello(&mut self, hello: Hello) {
+        if self.options.source.is_none()
+            && let Some(source) = hello.source
+        {
+            self.claim = Some(Claim::new(source));
+        }
+        self.hello = hello.labels;
         // Cached handles were built with the old labels.
         self.counters.clear();
         self.gauges.clear();
@@ -128,6 +207,18 @@ impl StreamState {
     }
 
     fn handle_metric(&mut self, metric: MetricData) {
+        let is_gauge = matches!(
+            metric.operation,
+            MetricOperation::IncrementGauge(_)
+                | MetricOperation::DecrementGauge(_)
+                | MetricOperation::SetGauge(_)
+        );
+        // Counters and histograms from an older generation still count: that
+        // work happened. Only gauges, which describe current state, belong to
+        // the newest sender.
+        if is_gauge && !self.may_set_gauges() {
+            return;
+        }
         let key = (metric.name, metric.labels);
         let extra = (&self.hello, &self.options.labels);
 
@@ -248,6 +339,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect(),
+            source: None,
         });
         (&event).try_into().unwrap()
     }
@@ -366,6 +458,95 @@ mod tests {
             rendered_closed.contains(r#"metrics_ipc_collector_connections{worker="1"} 0"#),
             "{rendered_closed}"
         );
+    }
+
+    fn sourced(name: &str, generation: u64, clear: bool) -> CollectorOptions {
+        let mut options = options(&[("worker", "1")]);
+        options.source = Some(Source {
+            name: name.into(),
+            generation,
+        });
+        options.clear_gauges_on_end = clear;
+        options
+    }
+
+    #[test]
+    fn newest_generation_owns_gauges_and_counters_accumulate() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let rendered = metrics::with_local_recorder(&recorder, || {
+            let mut old = StreamState::new(sourced("unit-overlap", 1, true));
+            old.handle_frame(&metric("inflight", &[], MetricOperation::SetGauge(5.0)));
+            old.handle_frame(&metric(
+                "served",
+                &[],
+                MetricOperation::IncrementCounter(100),
+            ));
+
+            let mut new = StreamState::new(sourced("unit-overlap", 2, true));
+            new.handle_frame(&metric("inflight", &[], MetricOperation::SetGauge(7.0)));
+            new.handle_frame(&metric("served", &[], MetricOperation::IncrementCounter(3)));
+
+            // The old sender is still draining: its gauge is ignored, its
+            // counter still counts.
+            old.handle_frame(&metric("inflight", &[], MetricOperation::SetGauge(9.0)));
+            old.handle_frame(&metric("served", &[], MetricOperation::IncrementCounter(1)));
+            // It exits, but it is no longer the newest, so nothing is cleared.
+            old.end_of_stream();
+            recorder.handle().render()
+        });
+        assert!(rendered.contains(r#"inflight{worker="1"} 7"#), "{rendered}");
+        assert!(rendered.contains(r#"served{worker="1"} 104"#), "{rendered}");
+    }
+
+    #[test]
+    fn newest_sender_exit_clears_its_gauges() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let rendered = metrics::with_local_recorder(&recorder, || {
+            let mut state = StreamState::new(sourced("unit-crash", 1, true));
+            state.handle_frame(&metric("inflight", &[], MetricOperation::SetGauge(5.0)));
+            state.handle_frame(&metric("served", &[], MetricOperation::IncrementCounter(8)));
+            state.end_of_stream();
+            recorder.handle().render()
+        });
+        assert!(rendered.contains(r#"inflight{worker="1"} 0"#), "{rendered}");
+        assert!(rendered.contains(r#"served{worker="1"} 8"#), "{rendered}");
+    }
+
+    #[test]
+    fn gauges_are_kept_without_clear_on_end() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let rendered = metrics::with_local_recorder(&recorder, || {
+            let mut state = StreamState::new(sourced("unit-keep", 1, false));
+            state.handle_frame(&metric("inflight", &[], MetricOperation::SetGauge(5.0)));
+            state.end_of_stream();
+            recorder.handle().render()
+        });
+        assert!(rendered.contains(r#"inflight{worker="1"} 5"#), "{rendered}");
+    }
+
+    #[test]
+    fn hello_sources_are_arbitrated_too() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let with_source = |generation| {
+            let event = MetricEvent::Hello(Hello {
+                labels: BTreeMap::new(),
+                source: Some(Source {
+                    name: "unit-hello".into(),
+                    generation,
+                }),
+            });
+            Vec::<u8>::try_from(&event).unwrap()
+        };
+        let rendered = metrics::with_local_recorder(&recorder, || {
+            let mut new = StreamState::new(options(&[]));
+            new.handle_frame(&with_source(5));
+            new.handle_frame(&metric("depth", &[], MetricOperation::SetGauge(1.0)));
+            let mut old = StreamState::new(options(&[]));
+            old.handle_frame(&with_source(4));
+            old.handle_frame(&metric("depth", &[], MetricOperation::SetGauge(2.0)));
+            recorder.handle().render()
+        });
+        assert!(rendered.contains("depth 1"), "{rendered}");
     }
 
     #[test]

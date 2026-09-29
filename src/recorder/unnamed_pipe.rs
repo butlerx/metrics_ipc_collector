@@ -119,6 +119,23 @@ impl IPCPipeRecorderBuilder {
             .fold(self, |builder, (key, value)| builder.with_label(key, value))
     }
 
+    /// Declares this recorder as generation `generation` of the sender
+    /// `name`, sent once per connection with the recorder labels.
+    ///
+    /// When several senders declare the same `name`, the collector only lets
+    /// the highest generation set gauges; counters and histograms from every
+    /// generation are kept. A parent process that knows the order of its
+    /// children should set this on the collector instead, which the sender
+    /// cannot override; see [`IPCPipeCollector::source`](crate::IPCPipeCollector::source).
+    #[must_use]
+    pub fn source(mut self, name: impl Into<String>, generation: u64) -> Self {
+        self.config.source = Some(crate::events::Source {
+            name: name.into(),
+            generation,
+        });
+        self
+    }
+
     /// Also reports the recorder's own counters to the collector:
     /// `metrics_ipc_recorder_dropped_events_total` and
     /// `metrics_ipc_recorder_reconnects_total`, labelled with the process id.

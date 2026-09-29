@@ -2,7 +2,7 @@ use super::{
     handle::{CollectorHandle, StopSignal},
     handlers::{CollectorOptions, StreamState},
 };
-use crate::{error::MetricsError, framing};
+use crate::{error::MetricsError, events::Source, framing};
 use interprocess::unnamed_pipe::pipe;
 #[cfg(feature = "tokio")]
 use tokio::runtime::Handle as TokioHandle;
@@ -33,6 +33,7 @@ pub struct IPCPipeCollector {
     receiver: PipeReceiver,
     labels: Vec<(String, String)>,
     internal_metrics: bool,
+    source: Option<Source>,
 }
 
 impl IPCPipeCollector {
@@ -76,6 +77,7 @@ impl IPCPipeCollector {
             receiver,
             labels: Vec::new(),
             internal_metrics: false,
+            source: None,
         }
     }
 
@@ -113,6 +115,33 @@ impl IPCPipeCollector {
         self
     }
 
+    /// Marks this pipe as generation `generation` of the sender `name`, for
+    /// when one sender replaces another, such as a respawned worker.
+    ///
+    /// Collectors in the same process that share a `name` coordinate:
+    ///
+    /// - Only the newest generation may set gauges. Gauge updates from older
+    ///   generations, such as a worker still draining after its replacement
+    ///   started, are ignored.
+    /// - Counters and histograms from every generation are kept, since that
+    ///   work really happened.
+    /// - When the newest generation's pipe closes, the gauges it set are
+    ///   zeroed, so a crashed sender's values do not linger.
+    ///
+    /// Use one pipe per sender process. Frames from several processes
+    /// writing to one pipe can interleave and cannot be told apart.
+    ///
+    /// This overrides a source the sender declares with
+    /// [`IPCPipeRecorderBuilder::source`](crate::IPCPipeRecorderBuilder::source).
+    #[must_use]
+    pub fn source(mut self, name: impl Into<String>, generation: u64) -> Self {
+        self.source = Some(Source {
+            name: name.into(),
+            generation,
+        });
+        self
+    }
+
     /// Starts collecting metrics from the unnamed pipe on a background thread,
     /// or a Tokio task when the `tokio` feature is enabled.
     ///
@@ -124,7 +153,9 @@ impl IPCPipeCollector {
     /// feature enabled, this also returns an error when called outside a Tokio
     /// runtime.
     pub fn start_collecting(self) -> Result<CollectorHandle, MetricsError> {
-        let options = CollectorOptions::new(self.labels, self.internal_metrics);
+        let mut options = CollectorOptions::new(self.labels, self.internal_metrics);
+        options.clear_gauges_on_end = self.source.is_some();
+        options.source = self.source;
 
         #[cfg(not(feature = "tokio"))]
         return CollectorHandle::spawn(move |stop| run_collector(self.receiver, options, &stop))
@@ -159,11 +190,13 @@ fn run_collector(receiver: PipeReceiver, options: CollectorOptions, stop: &StopS
             Ok(true) => state.handle_frame(&buffer),
             Ok(false) => {
                 log::info!("Metrics sender closed, stopping collector");
+                state.end_of_stream();
                 break;
             }
             Err(e) => {
                 log::error!("Error reading from pipe: {e}");
                 state.stream_error();
+                state.end_of_stream();
                 break;
             }
         }
@@ -188,11 +221,13 @@ async fn run_collector(
                 Ok(true) => state.handle_frame(&buffer),
                 Ok(false) => {
                     log::info!("Metrics sender closed, stopping collector");
+                    state.end_of_stream();
                     break;
                 }
                 Err(e) => {
                     log::error!("Error reading from pipe: {e}");
                     state.stream_error();
+                    state.end_of_stream();
                     break;
                 }
             },

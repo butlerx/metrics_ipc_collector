@@ -26,6 +26,8 @@ collecting metrics, making it suitable for multi-process applications.
   reconnect when the collector restarts.
 - **Internal metrics**: `internal_metrics(true)` on collectors and recorders
   reports dropped events, decode errors, reconnects and open connections.
+- **Sender replacement**: `source(name, generation)` lets a respawned worker
+  take over its predecessor's gauges and clears them when it exits.
 - **Batching**: `flush_interval(...)` on a recorder builder merges updates
   in-process and sends them periodically, instead of one IPC message per update.
 - **Shutdown**: `start_collecting()` returns a `CollectorHandle` with `stop()`,
@@ -225,8 +227,46 @@ choose a timeout well above the time between updates. Alternatively, have
 senders set their gauges periodically, or restrict the mask, for example to
 `MetricKindMask::GAUGE`.
 
-When a sender restarts, counters it sets with `absolute()` start again from
-zero. Prometheus treats that as a counter reset, and `rate()` handles it.
+## Counters across restarts
+
+Recorders send every counter update as an increment, including `absolute()`:
+they keep the counter's value locally and send the difference. A collector
+therefore only ever adds to a counter, so a restarted sender that counts from
+zero again carries on from the previous total instead of being ignored.
+Exporters built on `metrics` treat `absolute()` as "at least this value", so
+forwarding a restarted sender's absolute values would leave the counter stuck
+at the old maximum.
+
+## Replacing senders
+
+When a parent process replaces a child, such as a server respawning a
+worker, the old and new processes can overlap. Give each child its own pipe
+and tell each collector which generation it is:
+
+```rust
+// Parent: `respawns` goes up every time slot 3 gets a new worker.
+let (collector, sender) = IPCPipeCollector::new()?;
+let handle = collector
+    .with_label("worker", "3")
+    .source("worker-3", respawns)
+    .start_collecting()?;
+```
+
+Collectors that share a source name then coordinate:
+
+- **Gauges:** only the newest generation may set them. Updates from an older
+  generation that is still draining are ignored.
+- **Counters and histograms:** kept from every generation, since that work
+  really happened.
+- **Exit:** when the newest generation's pipe closes, the gauges it set are
+  zeroed, so a crashed worker's values do not linger.
+
+Senders on sockets can declare a source themselves with
+`IPCSocketRecorderBuilder::source`. Their gauges are arbitrated the same way
+but not zeroed on disconnect, since a socket sender may just be reconnecting.
+
+Use one pipe per process. Frames from several processes writing to one pipe
+can interleave and cannot be attributed to either sender.
 
 ## Socket addresses
 
