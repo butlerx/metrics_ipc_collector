@@ -61,10 +61,14 @@ impl RecorderConfig {
     }
 }
 
+/// One of the recorder's own counters.
+///
+/// Labelled with the process id: every recorder sends absolute values, so two
+/// recorders sharing a series would overwrite each other's counts.
 fn counter_event(name: &str, value: u64) -> MetricEvent {
     MetricEvent::Metric(MetricData {
         name: name.to_string(),
-        labels: BTreeMap::new(),
+        labels: BTreeMap::from([("pid".to_string(), std::process::id().to_string())]),
         operation: MetricOperation::SetCounter(value),
     })
 }

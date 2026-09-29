@@ -18,6 +18,45 @@ use tokio::{io::BufReader, runtime::Handle as TokioHandle, task};
 #[cfg(not(feature = "tokio"))]
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Clones of the open connections, so a stop can wake their blocked readers.
+#[cfg(all(unix, not(feature = "tokio")))]
+type OpenConnections = std::sync::Arc<
+    std::sync::Mutex<std::collections::HashMap<u64, std::os::unix::net::UnixStream>>,
+>;
+
+#[cfg(all(unix, not(feature = "tokio")))]
+fn lock_open(
+    open: &OpenConnections,
+) -> std::sync::MutexGuard<'_, std::collections::HashMap<u64, std::os::unix::net::UnixStream>> {
+    open.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Removes a connection from the open set when its reader finishes.
+#[cfg(all(unix, not(feature = "tokio")))]
+struct OpenGuard {
+    id: u64,
+    open: OpenConnections,
+}
+
+#[cfg(all(unix, not(feature = "tokio")))]
+impl Drop for OpenGuard {
+    fn drop(&mut self) {
+        lock_open(&self.open).remove(&self.id);
+    }
+}
+
+#[cfg(all(unix, not(feature = "tokio")))]
+fn track(open: &OpenConnections, id: u64, stream: &Stream) -> std::io::Result<OpenGuard> {
+    let Stream::UdSocket(socket) = stream;
+    let clone = socket.inner().try_clone()?;
+    lock_open(open).insert(id, clone);
+    Ok(OpenGuard {
+        id,
+        open: open.clone(),
+    })
+}
+
 /// Collects metrics sent by [`IPCSocketRecorder`](crate::IPCSocketRecorder)s
 /// over a local socket.
 ///
@@ -224,6 +263,12 @@ fn log_connection_error(e: &std::io::Error) {
 
 #[cfg(not(feature = "tokio"))]
 fn run_collector(listener: &Listener, options: &CollectorOptions, stop: &StopSignal) {
+    let mut readers: Vec<thread::JoinHandle<()>> = Vec::new();
+    #[cfg(unix)]
+    let open = OpenConnections::default();
+    #[cfg(unix)]
+    let mut next_id: u64 = 0;
+
     while !stop.is_stopped() {
         match listener.accept() {
             Ok(stream) => {
@@ -234,14 +279,45 @@ fn run_collector(listener: &Listener, options: &CollectorOptions, stop: &StopSig
                     log::debug!("Dropping metrics connection: {e}");
                     continue;
                 }
+                #[cfg(unix)]
+                let guard = match track(&open, next_id, &stream) {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        log::debug!("Dropping metrics connection: {e}");
+                        continue;
+                    }
+                };
+                #[cfg(unix)]
+                {
+                    next_id += 1;
+                }
                 let options = options.clone();
                 let stop = stop.clone();
-                thread::spawn(move || read_connection(stream, options, &stop));
+                readers.retain(|reader| !reader.is_finished());
+                readers.push(thread::spawn(move || {
+                    #[cfg(unix)]
+                    let _guard = guard;
+                    read_connection(stream, options, &stop);
+                }));
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(ACCEPT_POLL_INTERVAL);
             }
             Err(e) => log::debug!("Failed to accept metrics connection: {e}"),
+        }
+    }
+
+    // Wake readers blocked on a read so they exit now instead of at their
+    // next event, and so senders see the disconnect and reconnect straight
+    // away. Windows named pipes have no equivalent, so readers there are
+    // left to finish on their own.
+    #[cfg(unix)]
+    {
+        for socket in lock_open(&open).values() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+        for reader in readers {
+            let _ = reader.join();
         }
     }
 }

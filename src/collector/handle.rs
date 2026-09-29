@@ -48,10 +48,14 @@ impl StopSignal {
 /// dropping a [`std::thread::JoinHandle`].
 ///
 /// # Blocking mode
-/// Without the `tokio` feature, reads are blocking. After [`stop`](Self::stop)
-/// the listener stops accepting new connections within ~50ms, but a pipe or
-/// connection reader only notices the request when its next event arrives or
-/// its sender closes. Events received after a stop are discarded.
+/// Without the `tokio` feature, reads are blocking. After [`stop`](Self::stop):
+///
+/// - the socket listener stops accepting new connections within ~50ms;
+/// - on Unix, open socket connections are shut down straight away, and
+///   [`join`](Self::join) waits for their readers;
+/// - a pipe reader, or a socket reader on Windows, only notices the request
+///   when its next event arrives or its sender closes. Events received after
+///   a stop are discarded.
 #[derive(Debug)]
 pub struct CollectorHandle {
     #[cfg(not(feature = "tokio"))]

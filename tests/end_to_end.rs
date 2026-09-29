@@ -456,20 +456,18 @@ mod socket_addresses {
                 .start_collecting()
                 .unwrap();
 
-            // Keep recording until the new collector sees updates. The first
-            // update after the restart may go to the old connection.
-            let deadline = Instant::now() + TIMEOUT;
-            loop {
-                bump();
-                let rendered = prometheus().render();
-                if rendered.contains(r#"metrics_ipc_recorder_reconnects_total{generation="2"} 1"#)
-                    && rendered.contains(r#"e2e_reconnect_total{generation="2"}"#)
-                {
-                    break;
-                }
-                assert!(Instant::now() < deadline, "no reconnect in:\n{rendered}");
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            // The old connection was shut down when the first collector
+            // stopped, so the very first update reconnects and is delivered.
+            bump();
+            wait_for(&[r#"e2e_reconnect_total{generation="2"} 1"#]);
+
+            // Internal counters ride along with the next successful write.
+            bump();
+            let reconnects = format!(
+                r#"metrics_ipc_recorder_reconnects_total{{generation="2",pid="{}"}} 1"#,
+                std::process::id()
+            );
+            wait_for(&[&reconnects, r#"e2e_reconnect_total{generation="2"} 2"#]);
         });
     }
 }

@@ -193,7 +193,7 @@ collector labels:
 | `metrics_ipc_collector_stream_errors_total` | counter | streams dropped because of a read or wire-format error |
 
 Recorders with `internal_metrics(true)` send, labelled with their recorder
-labels:
+labels and a `pid` label so recorders never share a series:
 
 | metric | kind | meaning |
 |--------|------|---------|

@@ -121,7 +121,8 @@ impl IPCPipeRecorderBuilder {
 
     /// Also reports the recorder's own counters to the collector:
     /// `metrics_ipc_recorder_dropped_events_total` and
-    /// `metrics_ipc_recorder_reconnects_total`. Off by default.
+    /// `metrics_ipc_recorder_reconnects_total`, labelled with the process id.
+    /// Off by default.
     #[must_use]
     pub const fn internal_metrics(mut self, enabled: bool) -> Self {
         self.config.internal_metrics = enabled;
