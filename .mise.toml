@@ -1,7 +1,7 @@
 [tools]
 rust                   = { version = "stable", profile = "default", components = "rust-analyzer" }
 prek                   = "latest"
-tombi                  = "1.2.5"
+tombi                  = "1.11.2"
 zizmor                 = "latest"
 "cargo:cargo-binstall" = "latest"
 "cargo:cargo-audit"    = "latest"
@@ -15,9 +15,9 @@ cargo.binstall = true
 [tasks.build]
 description = "Build the library and examples"
 usage       = 'arg "[args]" var=#true help="Additional arguments passed to cargo build"'
-run         = "cargo build --all-features ${usage_args:-}"
+run         = "cargo build --all-features --lib --examples ${usage_args:-}"
 alias       = "b"
-sources     = ["Cargo.lock", "Cargo.toml", "src/**/*.rs"]
+sources     = ["Cargo.lock", "Cargo.toml", "src/**/*.rs", "examples/**/*.rs"]
 
 [tasks.test]
 description = "Run tests"
@@ -40,12 +40,12 @@ run         = "cargo clippy --fix --all-targets --all-features --allow-staged ${
 description = "Format Rust and TOML"
 run         = ["cargo fmt --all", "tombi format"]
 alias       = "f"
-sources     = ["src/**/*.rs", "tests/**/*.rs", "examples/**/*.rs", "Cargo.toml"]
+sources     = ["src/**/*.rs", "tests/**/*.rs", "examples/**/*.rs", "Cargo.toml", "*.toml", ".yamlfmt.yaml", ".editorconfig"]
 
 [tasks."format:check"]
 description = "Check Rust and TOML formatting"
 run         = ["cargo fmt --all --check", "tombi format --check"]
-sources     = ["src/**/*.rs", "tests/**/*.rs", "examples/**/*.rs", "Cargo.toml"]
+sources     = ["src/**/*.rs", "tests/**/*.rs", "examples/**/*.rs", "Cargo.toml", "*.toml", ".yamlfmt.yaml", ".editorconfig"]
 
 [tasks.audit]
 description = "Audit dependencies for known vulnerabilities"
