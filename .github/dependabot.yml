@@ -1,15 +1,24 @@
 version: 2
 updates:
-  - package-ecosystem: cargo
-    directory: /
+  - package-ecosystem: 'cargo'
+    directory: '/'
     schedule:
-      interval: weekly
+      interval: 'weekly'
+    groups:
+      metrics:
+        patterns:
+          - 'metrics*'
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: 'deps'
+      include: 'scope'
     cooldown:
       default-days: 7
 
-  - package-ecosystem: github-actions
-    directory: /
+  - package-ecosystem: 'github-actions'
+    directory: '/'
     schedule:
-      interval: weekly
+      interval: 'weekly'
+    open-pull-requests-limit: 10
     cooldown:
       default-days: 7
